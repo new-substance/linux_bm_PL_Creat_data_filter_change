@@ -1,0 +1,62 @@
+# Vivado project artifacts
+.vivado/
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.strwe/
+.Xil/
+*.jou
+*.log
+*.backup.jou
+*.backup.log
+usage_statistics_webtalk.*
+webtalk.*
+*.xpr
+*.data/
+*.gen/
+
+# Vivado output
+*.bit
+*.bin
+*.mcs
+*.prm
+*.bmm
+*.rpt
+*.dcp
+*.dcp.bak
+N/A/
+NA/
+
+# SDK / Vitis artifacts
+*.bsp/
+*.sdk_export/
+RemoteSystemsTempFiles/
+
+# Simulation
+*.wcfg
+*.wdb
+*.pb
+xsim.dir/
+vsim.wlf
+work/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# Vivado BD generated
+*.bd.bak
+
+# IP synthesis junk
+*.vds
+*_sim_netlist.*
+*_stub.*
