@@ -1,0 +1,2823 @@
+#ifndef __CSMA_LMAC_H_PROTECT
+#define __CSMA_LMAC_H_PROTECT
+
+/*---------------------------*\
+           Include
+\*---------------------------*/
+
+#include "xil_io.h"
+// #include "../../../../core/anosdef.h"
+#include "xparameters.h"
+#include "xbsp_fclk.h"
+#include "anos_ha_lmacdef.h"
+#include "xbsp_creg.h" // 包含寄存器操作基础组件
+#include "anosdef.h"
+// #include "../../../../core/net/anosnetpkt.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif // Compatible C++
+#ifdef DEBUG_LOCAL_LOG_OUTPUT
+#undef DEBUG_LOCAL_LOG_OUTPUT
+#endif
+#ifdef LOCAL_PRINTF
+#undef LOCAL_PRINTF
+#endif
+#define DEBUG_LOCAL_LOG_OUTPUT 1
+#if (DEBUG_LOCAL_LOG_OUTPUT == 1)
+#ifndef LOCAL_PRINTF
+#define LOCAL_PRINTF LOG_PRINTF
+#endif
+#else
+#define LOCAL_PRINTF
+#endif
+
+// [GEMINI_UPDATE]: Fallback for logging macros if not provided by environment
+#ifndef ULOG_ERROR
+#define ULOG_ERROR(fmt, ...) LOCAL_PRINTF("[ERROR] " fmt, ##__VA_ARGS__)
+#endif
+#ifndef LOG_PRINTF
+#define LOG_PRINTF printf
+#endif
+
+/*-------------------------------------------------------*\
+                        Define
+\*-------------------------------------------------------*/
+
+/**
+ * @brief 3级层次化802.11 Rx帧过滤器 — 7寄存器架构 (filter.v)
+ *
+ * =============================================================================
+ * 寄存器位布局 (slv_reg_22-28, AXI偏移 0x58-0x70, 每寄存器32bit)
+ * =============================================================================
+ *
+ * L0-Reg0 (0x58): L0 分类使能
+ *   [0]     ALL_DC     =1: 旁路全部L0, 帧直接PASS
+ *   [1]     EN_CTRL    =1: 使能 Control 帧大类
+ *   [2]     EN_DATA    =1: 使能 Data 帧大类
+ *   [3]     EN_MANAGE  =1: 使能 Management 帧大类
+ *   [4]     EN_USR     =1: 使能用户自定义
+ *   [27:5]  reserved
+ *   [28]    UPDATE_VALID   =1: 锁存到影子寄存器
+ *   [31:29] reserved
+ *
+ * L1-Reg0 (0x5C): CTRL子类型[9:0] + DATA子类型[21:16]
+ *   [0]     CTRL_DC       =1: CTRL帧旁路 (直接PASS)
+ *   [1]     CTRL_RTS      =1: RTS
+ *   [2]     CTRL_CTS      =1: CTS
+ *   [3]     CTRL_ACK      =1: ACK
+ *   [4]     CTRL_BAR      =1: Block Ack Request
+ *   [5]     CTRL_MTID_BAR =1: Multi-TID BAR
+ *   [6]     CTRL_BA       =1: Block Ack
+ *   [7]     CTRL_MTID_BA  =1: Multi-TID BA
+ *   [8]     CTRL_PS_POLL  =1: PS-Poll
+ *   [9]     CTRL_CF_ABOUT =1: CF-End / CF-End+Ack
+ *   [15:10] reserved
+ *   [16]    DATA_DC        =1: DATA帧旁路
+ *   [17]    DATA_BROADCAST =1: 广播 (addr1=FF:FF:FF:FF:FF:FF)
+ *   [18]    DATA_MULTICAST =1: 组播 (01:00:5E:xx 或 33:33:xx)
+ *   [19]    DATA_SELF_MAC  =1: addr1==self_mac_addr (发给本机)
+ *   [20]    DATA_UNIQUE_MAC=1: addr1 是唯一单播 (非bc/mc/self)
+ *   [21]    DATA_UNICAST   =1: 任意单播 (非bc/mc)
+ *   [27:22] reserved
+ *   [28]    UPDATE_VALID
+ *   [31:29] reserved
+ *
+ * L1-Reg1 (0x60): MANAGE子类型[11:0] + USR子类型[21:16]
+ *   [0]     MANAGE_DC          =1: MANAGE帧旁路
+ *   [1]     MANAGE_BEACON      =1: Beacon
+ *   [2]     MANAGE_ASSOC_REQ   =1: Association Request
+ *   [3]     MANAGE_ASSOC_REP   =1: Association Response
+ *   [4]     MANAGE_REASSOC_REQ =1: Reassociation Request
+ *   [5]     MANAGE_REASSOC_REP =1: Reassociation Response
+ *   [6]     MANAGE_DEASSOC     =1: Disassociation
+ *   [7]     MANAGE_DETECT_REQ  =1: Probe Request
+ *   [8]     MANAGE_DETECT_REP  =1: Probe Response
+ *   [9]     MANAGE_AUTH        =1: Authentication
+ *   [10]    MANAGE_DEAUTH      =1: Deauthentication
+ *   [11]    MANAGE_OTHER       =1: 其他管理帧
+ *   [15:12] reserved
+ *   [16]    USR_DC             =1: USR帧旁路
+ *   [17]    USR_HA_MERCURY     =1: HA Mercury
+ *   [18]    USR_HA_EHBEACON    =1: HA EH Beacon
+ *   [19]    USR_HA_DATA        =1: HA Data
+ *   [20]    USR_RESERVE0       =1: 预留
+ *   [21]    USR_RESERVE1       =1: 预留
+ *   [27:22] reserved
+ *   [28]    UPDATE_VALID
+ *   [31:29] reserved
+ *
+ * L2-Reg0 (0x64): TOUCH/MR/NMR + 使能位 + THIS_LDC + FC_USR + UPDATE_VALID[31:28]
+ *   [0]     THIS_LDC     =1: L2旁路, 帧直接PASS (跳过L2所有判定)
+ *   [1]     TOUCH0       TOUCH 使能位 (L0级 帧大类判定控制)
+ *   [3:2]   MR0          L0 匹配成功时的动作码 (00=PASS 01=FAIL 10=NEXT)
+ *   [5:4]   NMR0         L0 匹配失败时的动作码
+ *   [6]     TOUCH1       TOUCH 使能位 (L1级 子类型判定控制)
+ *   [8:7]   MR1          L1 匹配成功时的动作码
+ *   [10:9]  NMR1         L1 匹配失败时的动作码
+ *   [11]    TOUCH2       TOUCH 使能位 (L2级 复合匹配判定控制)
+ *   [13:12] MR2          L2 复合匹配成功时的动作码
+ *   [15:14] NMR2         L2 复合匹配失败时的动作码
+ *   [23:16] FC_USR       FC字段用户期望值[7:0] = {FC_type[1:0], FC_subtype[3:0], tofrom_ds[1:0]}
+ *   [24]    EN_BSSID     =1: L2 使能 BSSID 匹配 (v2.1 NEW)
+ *   [25]    EN_FC        =1: L2 使能 FC 匹配 (v2.1 NEW)
+ *   [26]    EN_ADDR2     =1: L2 使能 ADDR2 匹配 (v2.1 NEW)
+ *   [27]    EN_ADDR1     =1: L2 使能 ADDR1 匹配 (v2.1 NEW)
+ *   [28]    L2_UV_R0     =1: 锁存 L2-Reg0 到影子寄存器
+ *   [29]    L2_UV_R1     =1: 锁存 L2-Reg1 (ADDR1[31:0])
+ *   [30]    L2_UV_R2     =1: 锁存 L2-Reg2 (ADDR1[47:32]|ADDR2[15:0])
+ *   [31]    L2_UV_R3     =1: 锁存 L2-Reg3 (ADDR2[47:16])
+ *
+ * L2-Reg1 (0x68): ADDR1[31:0]  — 过滤匹配地址1 低32bit (非本机地址)
+ * L2-Reg2 (0x6C): {ADDR2[15:0], ADDR1[47:32]} — ADDR1高16bit | ADDR2低16bit
+ * L2-Reg3 (0x70): ADDR2[47:16] — 过滤匹配地址2 高32bit (非本机地址)
+ * L2-Reg4 (0x74): BSSID[31:0]  — 过滤匹配 BSSID 低32bit (v2.1 NEW)
+ * L2-Reg5 (0x78): BSSID[47:32]@[15:0] + BSSID_UV@[28] (v2.1 NEW)
+ *                   BSSID 提取自 RX 帧: FC_tofrom_ds=10→addr1, 01→addr2, 00→addr3
+ *
+ * =============================================================================
+ * 本机地址 vs 过滤地址 (重要区分)
+ * =============================================================================
+ *   self_mac_addr → PL硬件连线, 用于 L1 DATA 的 SELF_MAC 判定 (不可软件配置)
+ *   self_bssid    → PL硬件连线, 预留 (filter.v 暂未使用)
+ *   ADDR1/ADDR2   → AXI寄存器配置, L2 级与 RX 帧 addr1/addr2 比较过滤
+ *   如需按 BSSID 过滤: 将目标 BSSID 写入 ADDR1 或 ADDR2
+ *
+ * =============================================================================
+ * 过滤流水线: IDLE → L0(帧大类) → L1(子类型) → L2(地址+FC) → 输出
+ * =============================================================================
+ *   每级判定逻辑 (v2.1: TOUCH 按级别对应 + L2 复合匹配 + BSSID 过滤):
+ *     L0: L0_ALL_DC=1 → PASS;  TOUCH0/MR0/NMR0 按 l0_match 裁决 → PASS/FAIL/L1
+ *     L1: L1_xx_DC=1  → PASS;  TOUCH1/MR1/NMR1 按 l1_hit   裁决 → PASS/FAIL/L2
+ *     L2: THIS_LDC=1  → PASS;  四个子功能使能 AND 组成复合匹配:
+ *           EN_ADDR1→ADDR1, EN_ADDR2→ADDR2, EN_FC→FC, EN_BSSID→BSSID
+ *           l2_match 送入 TOUCH2/MR2/NMR2 裁决 → PASS/FAIL (末级 NEXT==PASS)
+ *     signal_len < 14 → ST_ABNORMAL → DROP (v2.1 NEW)
+ *
+ * =============================================================================
+ * UPDATE_VALID 原子锁存协议
+ * =============================================================================
+ *   每个寄存器写两次: 第1次 UV=0 预装, 第2次 UV=1 锁存到影子寄存器
+ *   L0/L1 各自 bit[28] 独立控制
+ *   L2-Reg0[31:28] 集中控制全部4个L2寄存器
+ */
+
+// ---- TOUCH/MR/NMR 5模式编码 ----
+// 每级过滤由 1-bit TOUCH + 2-bit MR + 2-bit NMR 组成, 共5种工作模式:
+//
+//   DONTTOUCH:  TOUCH=0, MR/NMR=XX     → 本级完全旁路, 不参与判定
+//   DONTCARE:   TOUCH=1, MR=00, NMR=00 → 无条件 PASS (不关心匹配结果)
+//   DISABLE:    TOUCH=1, MR=01, NMR=01 → 无条件 FAIL (屏蔽/丢弃)
+//   NEXTLEVEL:  TOUCH=1, MR=10, NMR=10 → 继续下一级判定 (本级不裁决)
+//   TOUCH:      TOUCH=1, MR≠NMR        → 有条件判定:
+//                   本级匹配成功 → 执行 MR 动作码
+//                   本级匹配失败 → 执行 NMR 动作码
+//
+// MR/NMR 动作码: 0x0=PASS(通过) 0x1=FAIL(丢弃) 0x2=NEXT(下一级) 0x3=保留
+#define FILTER_MR_NMR_SUCCESS   0u   // 00: 通过/放行
+#define FILTER_MR_NMR_FAIL      1u   // 01: 失败/丢弃
+#define FILTER_MR_NMR_NEXT      2u   // 10: 继续下一级
+
+/**
+ * @brief [DEPRECATED] 旧版过滤器标志位 — 保留兼容, 新代码请使用 L0/L1/L2 寄存器宏
+ */
+#define FIF_ALLMULTI            (1<<1)
+#define FIF_FCSFAIL             (1<<2)
+#define FIF_PLCPFAIL            (1<<3)
+#define FIF_BCN_PRBRESP_PROMISC (1<<4)
+#define FIF_CONTROL             (1<<5)
+#define FIF_OTHER_BSS           (1<<6)
+#define FIF_PSPOLL              (1<<7)
+#define FIF_PROBE_REQ           (1<<8)
+#define UNICAST_FOR_US          (1<<9)
+#define BROADCAST_ALL_ONE       (1<<10)
+#define BROADCAST_ALL_ZERO      (1<<11)
+#define MY_BEACON               (1<<12)
+#define MONITOR_ALL             (1<<13)
+#define FIF_DISCARD_MASK        (0x1FF<<16)
+#define ANOS_HA_RAT_FILTER_FLAG (FIF_DISCARD_MASK | FIF_ALLMULTI | FIF_BCN_PRBRESP_PROMISC | \
+                                FIF_OTHER_BSS | FIF_PSPOLL | FIF_PROBE_REQ | UNICAST_FOR_US | \
+                                BROADCAST_ALL_ONE | BROADCAST_ALL_ZERO | MY_BEACON)
+
+//* CSMA low mac(XPU) 寄存器定义
+
+#define CREG_HA_RAT_XPU_REG_BASE_ADDR (XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR)
+
+#define CREG_HA_RAT_XPU_REG_RESET               (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x00)
+// #define CREG_HA_RAT_XPU_REG_SRC_SEL             (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x04) // [GEMINI_DELETE]: Obsolete
+#define CREG_HA_RAT_XPU_REG_TSF_LOAD_VAL_LOW    (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x08)
+#define CREG_HA_RAT_XPU_REG_TSF_LOAD_VAL_HIGH   (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x0C)
+#define CREG_HA_RAT_XPU_REG_BAND_CHANNEL        (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x10)
+#define CREG_HA_RAT_XPU_REG_CW_MIN_ADDR         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x14) // CW MIN 1~6
+
+#define CREG_HA_RAT_XPU_REG_RSSI_DB_CFG         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x1C) // RSSI dB, gpio delay, fifo_delay reset 均在这个寄存器中设置
+#define CREG_HA_RAT_XPU_REG_LBT_TH              (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x20)
+#define CREG_HA_RAT_XPU_REG_CSMA_TIME_DEBUG     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x24)
+#define CREG_HA_RAT_XPU_REG_BB_RF_DELAY         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x28)
+#define CREG_HA_RAT_XPU_REG_MAX_NUM_RETRANS     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x2C)
+#define CREG_HA_RAT_XPU_REG_AIFS_AC_CFG         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x30)
+#define CREG_HA_RAT_XPU_REG_TX_HIGH_ALLOWED_SW_ADDR         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x34)
+
+#define CREG_HA_RAT_XPU_REG_SEND_ACK_WAIT_TOP   (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x38)
+#define CREG_HA_RAT_XPU_REG_CSMA_CFG            (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x3C)
+
+#define CREG_HA_RAT_XPU_REG_CTS_TO_RTS_CONFIG   (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x40)
+// [DEPRECATED] old single-register filter, replaced by 7-register architecture below
+#define CREG_HA_RAT_XPU_REG_FILTER_FLAG_DEPRECATED (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x44)
+
+// New 9-register Rx frame filter architecture v2.1 (slv_reg_22-30, AXI offsets 0x58-0x78)
+// L2 ADDR1/ADDR2 are filter match addresses (compared against RX frame addr1/addr2)
+// They are NOT the local MAC or BSSID — local addresses come from PL hardware wires
+// NEW v2.1: L2-Reg4/Reg5 = BSSID 过滤目标地址 + BSSID_UV@[28]
+#define CREG_HA_RAT_XPU_REG_FILTER_L0_CTRL     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x58)
+#define CREG_HA_RAT_XPU_REG_FILTER_L1_CFG0     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x5C)
+#define CREG_HA_RAT_XPU_REG_FILTER_L1_CFG1     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x60)
+#define CREG_HA_RAT_XPU_REG_FILTER_L2_CFG0     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x64)  // TOUCH/MR/NMR + EN_* + THIS_LDC + FC_USR + UV[31:28]
+#define CREG_HA_RAT_XPU_REG_FILTER_L2_CFG1     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x68)  // ADDR1[31:0] — 过滤匹配地址(非本机)
+#define CREG_HA_RAT_XPU_REG_FILTER_L2_CFG2     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x6C)  // ADDR1[47:32] | ADDR2[15:0]
+#define CREG_HA_RAT_XPU_REG_FILTER_L2_CFG3     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x70)  // ADDR2[47:16] — 过滤匹配地址(非本机)
+#define CREG_HA_RAT_XPU_REG_FILTER_L2_CFG4     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x74)  // BSSID[31:0]  — 过滤匹配 BSSID 低 32bit (v2.1)
+#define CREG_HA_RAT_XPU_REG_FILTER_L2_CFG5     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x78)  // BSSID[47:16] + BSSID_UV@[28] (v2.1)
+// BSSID 寄存器 — TX 端 BSSID 配置 (非 RX 过滤器, 用于 Beacon/Association 等帧的 BSSID 字段)
+#define CREG_HA_RAT_XPU_REG_BSSID_LOW     (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x48)
+#define CREG_HA_RAT_XPU_REG_BSSID_HIGH    (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x4c)
+// MAC 地址寄存器 — TX 端本机 MAC 地址配置 (用于 TX 帧头 TA/SA 字段, 非 RX 过滤器)
+//   RX 过滤器的 L1 SELF_MAC 判定由 PL 硬件连线 self_mac_addr 自动完成
+#define CREG_HA_RAT_XPU_REG_MAC_ADDR_LOW         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x50)
+#define CREG_HA_RAT_XPU_REG_MAC_ADDR_HIGH        (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x54)
+
+// ADDR1-4 只读寄存器 — 存放实际接收帧的 addr1~addr4 字段值 (由 PL 硬件从 RX 帧解析写入)
+//   与 L2-Reg1/2/3 的区别: L2-Reg1/2/3 是 writable 过滤匹配地址, 与 RX 帧比较
+//   ADDR1-4 是 read-only 实际帧地址, 供 PS 端读取诊断/监控, 不参与过滤
+#define CREG_HA_RAT_XPU_REG_FC_DI_ADDR           (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x80)
+#define CREG_HA_RAT_XPU_REG_ADDR1_LOW            (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x84)
+#define CREG_HA_RAT_XPU_REG_ADDR1_HIGH           (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x88)
+#define CREG_HA_RAT_XPU_REG_ADDR2_LOW            (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x8c)
+#define CREG_HA_RAT_XPU_REG_ADDR2_HIGH           (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x90)
+#define CREG_HA_RAT_XPU_REG_ADDR3_LOW            (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x94)
+#define CREG_HA_RAT_XPU_REG_ADDR3_HIGH           (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x98)
+#define CREG_HA_RAT_XPU_REG_SC_LOW               (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x9c)
+#define CREG_HA_RAT_XPU_REG_ADDR4_HIGH           (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xa0)
+#define CREG_HA_RAT_XPU_REG_ADDR4_LOW            (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xa4)
+
+#define CREG_HA_RAT_XPU_REG_TX_RESULT           (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xa8)
+#define CREG_HA_RAT_XPU_REG_TX_QUEUE_NOW_TO_PS  (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xac)
+
+#define CREG_HA_RAT_XPU_REG_TSF_RUNTIME_VAL_LOW             (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xb0)
+#define CREG_HA_RAT_XPU_REG_TSF_RUNTIME_VAL_HIGH            (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xb4)
+
+#define CREG_HA_RAT_XPU_REG_RSSI_HALF_DB_ADDR         (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xb8)
+#define CREG_HA_RAT_XPU_REG_IQ_RSSI_HALF_DB_ADDR      (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xbc)
+
+#define CREG_HA_RAT_XPU_REG_CSMA_TX_HIGH_STATE_ADDR   (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xc8)
+#define CREG_HA_RAT_XPU_REG_RSSI_DB_STATE_ADDR        (CREG_HA_RAT_XPU_REG_BASE_ADDR + 0xcc)
+
+//* CSMA low mac(XPU) 掩码和偏移定义
+
+// XPU Reset Reg
+#define CREG_HA_RAT_XPU_RESET_MASK (0XFFFFFFFF)
+
+// XPU CW Min Reg // [GEMINI_UPDATE]: Updated to match latest Linux side config (hw_def.h/low_mac.c)
+#define CREG_HA_RAT_XPU_CW1_OFFSET (0)
+#define CREG_HA_RAT_XPU_CW2_OFFSET (4)
+#define CREG_HA_RAT_XPU_CW3_OFFSET (8)
+#define CREG_HA_RAT_XPU_CW4_OFFSET (12)
+#define CREG_HA_RAT_XPU_CW5_OFFSET (16)
+#define CREG_HA_RAT_XPU_CW6_OFFSET (20)
+
+#define CREG_HA_RAT_XPU_CW1_MASK (0x0000000F)
+#define CREG_HA_RAT_XPU_CW2_MASK (0x000000F0)
+#define CREG_HA_RAT_XPU_CW3_MASK (0x00000F00)
+#define CREG_HA_RAT_XPU_CW4_MASK (0x0000F000)
+#define CREG_HA_RAT_XPU_CW5_MASK (0x000F0000)
+#define CREG_HA_RAT_XPU_CW6_MASK (0x00F00000)
+
+// TSF_LOAD_VAL Register
+#define CREG_HA_RAT_XPU_TSF_LOAD_VAL_SET_OFFSET       (31)
+#define CREG_HA_RAT_XPU_TSF_LOAD_VAL_SET_MASK       (0x80000000)
+// BAND_CHANNEL Register
+#define CREG_HA_RAT_XPU_BAND_CHANNEL_ERP_SHORT_SLOT_OFFSET  (24)
+#define CREG_HA_RAT_XPU_BAND_CHANNEL_BAND_OFFSET            (16)
+#define CREG_HA_RAT_XPU_BAND_CHANNEL_CHANNEL_OFFSET         (0)
+#define CREG_HA_RAT_XPU_BAND_CHANNEL_ERP_SHORT_SLOT_MASK    (0x01000000)
+#define CREG_HA_RAT_XPU_BAND_CHANNEL_BAND_MASK              (0x000F0000)
+#define CREG_HA_RAT_XPU_BAND_CHANNEL_CHANNEL_MASK           (0x0000FFFF)
+// RSSI_DB_CFG Register
+#define CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_FIFO_DELAY_RSTN_OFFSET (31)
+#define CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_HALF_DB_OFFSET_OFFSET  (16)
+#define CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_DELAY_CTL_OFFSET       (0)
+#define CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_FIFO_DELAY_RSTN_MASK   (0x80000000)
+#define CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_HALF_DB_OFFSET_MASK    (0x07FF0000)
+#define CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_DELAY_CTL_MASK         (0x0000007F)
+// LBT_TH Register
+#define CREG_HA_RAT_XPU_LBT_TH_CCA_RSSI_HALF_DB_TH_OFFSET       (0)
+#define CREG_HA_RAT_XPU_LBT_TH_CCA_RSSI_HALF_DB_TH_MASK         (0x000007FF)
+// CSMA_TIME_DEBUG Register
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_MSB_OFFSET                      (31)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PREAMBLE_SIG_TIME_OFFSET        (24)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_OFDM_SYMBOL_TIME_OFFSET         (19)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SLOT_TIME_OFFSET                (14)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SIFS_TIME_OFFSET                (7)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PHY_RX_START_DELAY_TIME_OFFSET  (0)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_MSB_MASK                        (0x80000000)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PREAMBLE_SIG_TIME_MASK          (0x7F000000)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_OFDM_SYMBOL_TIME_MASK           (0x00F80000)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SLOT_TIME_MASK                  (0x0007C000)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SIFS_TIME_MASK                  (0x00003F80)
+#define CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PHY_RX_START_DELAY_TIME_MASK    (0x0000007F)
+// BB_RF_DELAY
+#define CREG_HA_RAT_XPU_BB_RF_DELAY_TX_OFFSET       (0)
+#define CREG_HA_RAT_XPU_BB_RF_DELAY_TX_MASK         (0x00000FFF)
+// MAX_NUM_RETRANS Register
+#define CREG_HA_RAT_XPU_MAX_NUM_RETRANS_OFFSET      (0)
+#define CREG_HA_RAT_XPU_MAX_NUM_RETRANS_MASK        (0x0000000F)
+// RECV_ACK_COUNT_TOP_2dot4GHz Register (修改过 未更新) (old)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_2dot4GHz_PHY_HEADER_DETECT_TIMEOUT_OFFSET    (16)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_2dot4GHz_OFDM_DECODE_TIMEOUT_OFFSET          (0)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_2dot4GHz_ACK_WITH_VALID_FCS_OFFSET           (31)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_2dot4GHz_PHY_HEADER_DETECT_TIMEOUT_MASK  (0x7FFF0000)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_2dot4GHz_OFDM_DECODE_TIMEOUT_MASK        (0x00007FFF)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_2dot4GHz_ACK_WITH_VALID_FCS_MASK         (0x80000000)
+// (new)
+#define CREG_HA_RAT_XPU_AIFS_AC1_OFFSET (0)
+#define CREG_HA_RAT_XPU_AIFS_AC2_OFFSET (4)
+#define CREG_HA_RAT_XPU_AIFS_AC3_OFFSET (8)
+#define CREG_HA_RAT_XPU_AIFS_AC4_OFFSET (12)
+#define CREG_HA_RAT_XPU_AIFS_ACHP_OFFSET (16)
+#define CREG_HA_RAT_XPU_PS_ADJUST_TIME_OFFSET (20)
+
+#define CREG_HA_RAT_XPU_AIFS_AC1_MASK (0x0000000F)
+#define CREG_HA_RAT_XPU_AIFS_AC2_MASK (0x000000F0)
+#define CREG_HA_RAT_XPU_AIFS_AC3_MASK (0x00000F00)
+#define CREG_HA_RAT_XPU_AIFS_AC4_MASK (0x0000F000)
+#define CREG_HA_RAT_XPU_AIFS_ACHP_MASK (0x000F0000)
+#define CREG_HA_RAT_XPU_PS_ADJUST_TIME_MASK (0xFFF00000)
+
+// RECV_ACK_COUNT_TOP_5GHz Register (修改过 未更新) (old)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_5GHz_PHY_HEADER_DETECT_TIMEOUT_OFFSET    (16)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_5GHz_OFDM_DECODE_TIMEOUT_OFFSET          (0)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_5GHz_ACK_WITH_VALID_FCS_OFFSET           (31)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_5GHz_PHY_HEADER_DETECT_TIMEOUT_MASK      (0x7FFF0000)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_5GHz_OFDM_DECODE_TIMEOUT_MASK            (0x00007FFF)
+// #define CREG_HA_RAT_XPU_RECV_ACK_COUNT_TOP_5GHz_ACK_WITH_VALID_FCS_MASK             (0x80000000)
+// (new)
+#define CREG_HA_RAT_XPU_TX_HIGH_ALLOWED_SW_OFFSET (0)
+
+#define CREG_HA_RAT_XPU_TX_HIGH_ALLOWED_SW_MASK (0x0000003F)
+
+// SEND_ACK_WAIT_TOP Register
+#define CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_5GHz_DELAY_BEFORE_TX_OFFSET       (16)
+#define CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_2dot4GHz_DELAY_BEFORE_TX_OFFSET   (0)
+#define CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_5GHz_DELAY_BEFORE_TX_MASK      (0xFFFF0000)
+#define CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_2dot4GHz_DELAY_BEFORE_TX_MASK  (0x0000FFFF)
+// CSMA_CFG Register
+#define CREG_HA_RAT_XPU_CSMA_CFG_NAV_DISABLE_OFFSET     (31)
+#define CREG_HA_RAT_XPU_CSMA_CFG_DIFS_DISABLE_OFFSET    (30)
+#define CREG_HA_RAT_XPU_CSMA_CFG_EIFS_DISABLE_OFFSET    (29)
+// #define CREG_HA_RAT_XPU_CSMA_CFG_CW_MIN_OFFSET          (0)
+#define CREG_HA_RAT_XPU_CSMA_CFG_NAV_DISABLE_MASK       (0x80000000)
+#define CREG_HA_RAT_XPU_CSMA_CFG_DIFS_DISABLE_MASK      (0x40000000)
+#define CREG_HA_RAT_XPU_CSMA_CFG_EIFS_DISABLE_MASK      (0x20000000)
+// #define CREG_HA_RAT_XPU_CSMA_CFG_CW_MIN_MASK            (0x00000000) // [GEMINI_DELETE]: Obsolete
+
+// SLICE_COUNT // [GEMINI_DELETE]: Obsolete macros
+// #define CREG_HA_RAT_XPU_REG_SLICE_COUNT_TOTAL0_MASK (0x000FFFFF)
+// #define CREG_HA_RAT_XPU_REG_SLICE_COUNT_START0_MASK (0x000FFFFF)
+// #define CREG_HA_RAT_XPU_REG_SLICE_COUNT_END0_MASK (0x000FFFFF)
+// #define CREG_HA_RAT_XPU_REG_SLICE_COUNT_TOTAL1_MASK (0x000FFFFF)
+// #define CREG_HA_RAT_XPU_REG_SLICE_COUNT_START1_MASK (0x000FFFFF)
+// #define CREG_HA_RAT_XPU_REG_SLICE_COUNT_END1_MASK (0x000FFFFF)
+
+// CTS_TO_RTS_CONFIG
+#define CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_DISABLE_OFFSET        (31)
+#define CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_RATE_MCS_OFFSET       (16)
+#define CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_EXTRA_DURATION_OFFSET (0)
+#define CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_DISABLE_MASK          (0x80000000)
+#define CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_RATE_MCS_MASK         (0x001F0000)
+#define CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_EXTRA_DURATION_MASK   (0x0000FFFF)
+// =============================================================================
+// 7-Register Filter Field Definitions (matching filter.v bit layout)
+// =============================================================================
+
+// ---- UPDATE_VALID bit positions ----
+// Each register must be written twice: first with UV=0, then with UV=1 to latch
+#define CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET       28
+#define CREG_HA_RAT_FILTER_L2_UV_R0_OFFSET           28  // L2-Reg0 update valid
+#define CREG_HA_RAT_FILTER_L2_UV_R1_OFFSET           29  // L2-Reg1 update valid (in L2-Reg0)
+#define CREG_HA_RAT_FILTER_L2_UV_R2_OFFSET           30  // L2-Reg2 update valid (in L2-Reg0)
+#define CREG_HA_RAT_FILTER_L2_UV_R3_OFFSET           31  // L2-Reg3 update valid (in L2-Reg0)
+#define CREG_HA_RAT_FILTER_L2_UV_ALL_MASK             (0xFu << 28)
+#define CREG_HA_RAT_FILTER_BSSID_UV_OFFSET            28  // L2-Reg5[28]: 锁存 L2-Reg4+Reg5 (v2.1)
+
+// ---- L2-Reg0: L2 复合匹配使能位 [27:24] (v2.1 NEW) ----
+#define CREG_HA_RAT_FILTER_L2_EN_BSSID_OFFSET         24
+#define CREG_HA_RAT_FILTER_L2_EN_FC_OFFSET            25
+#define CREG_HA_RAT_FILTER_L2_EN_ADDR2_OFFSET         26
+#define CREG_HA_RAT_FILTER_L2_EN_ADDR1_OFFSET         27
+#define CREG_HA_RAT_FILTER_L2_EN_BSSID_MASK           (1u << 24)
+#define CREG_HA_RAT_FILTER_L2_EN_FC_MASK              (1u << 25)
+#define CREG_HA_RAT_FILTER_L2_EN_ADDR2_MASK           (1u << 26)
+#define CREG_HA_RAT_FILTER_L2_EN_ADDR1_MASK           (1u << 27)
+
+// ---- L0-Reg0: bit[4:0] classification enables, bit[28] UPDATE_VALID ----
+#define CREG_HA_RAT_FILTER_L0_ALL_DC_OFFSET          0
+#define CREG_HA_RAT_FILTER_L0_EN_CTRL_OFFSET         1
+#define CREG_HA_RAT_FILTER_L0_EN_DATA_OFFSET         2
+#define CREG_HA_RAT_FILTER_L0_EN_MANAGE_OFFSET       3
+#define CREG_HA_RAT_FILTER_L0_EN_USR_OFFSET          4
+#define CREG_HA_RAT_FILTER_L0_ALL_DC_MASK            (1u << 0)
+#define CREG_HA_RAT_FILTER_L0_EN_CTRL_MASK           (1u << 1)
+#define CREG_HA_RAT_FILTER_L0_EN_DATA_MASK           (1u << 2)
+#define CREG_HA_RAT_FILTER_L0_EN_MANAGE_MASK         (1u << 3)
+#define CREG_HA_RAT_FILTER_L0_EN_USR_MASK            (1u << 4)
+
+// ---- L1-Reg0: CTRL[9:0] + DATA[21:16], bit[28] UPDATE_VALID ----
+// CTRL subtypes
+#define CREG_HA_RAT_FILTER_L1_CTRL_DC_OFFSET         0
+#define CREG_HA_RAT_FILTER_L1_CTRL_RTS_OFFSET        1
+#define CREG_HA_RAT_FILTER_L1_CTRL_CTS_OFFSET        2
+#define CREG_HA_RAT_FILTER_L1_CTRL_ACK_OFFSET        3
+#define CREG_HA_RAT_FILTER_L1_CTRL_BAR_OFFSET        4
+#define CREG_HA_RAT_FILTER_L1_CTRL_MTID_BAR_OFFSET   5
+#define CREG_HA_RAT_FILTER_L1_CTRL_BA_OFFSET         6
+#define CREG_HA_RAT_FILTER_L1_CTRL_MTID_BA_OFFSET    7
+#define CREG_HA_RAT_FILTER_L1_CTRL_PS_POLL_OFFSET    8
+#define CREG_HA_RAT_FILTER_L1_CTRL_CF_ABOUT_OFFSET   9
+// DATA address attributes
+#define CREG_HA_RAT_FILTER_L1_DATA_DC_OFFSET         16
+#define CREG_HA_RAT_FILTER_L1_DATA_BROADCAST_OFFSET  17
+#define CREG_HA_RAT_FILTER_L1_DATA_MULTICAST_OFFSET  18
+#define CREG_HA_RAT_FILTER_L1_DATA_SELF_MAC_OFFSET   19
+#define CREG_HA_RAT_FILTER_L1_DATA_UNIQUE_MAC_OFFSET 20
+#define CREG_HA_RAT_FILTER_L1_DATA_UNICAST_OFFSET    21
+
+// ---- L1-Reg1: MANAGE[11:0] + USR[21:16], bit[28] UPDATE_VALID ----
+// MANAGE subtypes
+#define CREG_HA_RAT_FILTER_L1_MANAGE_DC_OFFSET           0
+#define CREG_HA_RAT_FILTER_L1_MANAGE_BEACON_OFFSET       1
+#define CREG_HA_RAT_FILTER_L1_MANAGE_ASSOC_REQ_OFFSET    2
+#define CREG_HA_RAT_FILTER_L1_MANAGE_ASSOC_REP_OFFSET    3
+#define CREG_HA_RAT_FILTER_L1_MANAGE_REASSOC_REQ_OFFSET  4
+#define CREG_HA_RAT_FILTER_L1_MANAGE_REASSOC_REP_OFFSET  5
+#define CREG_HA_RAT_FILTER_L1_MANAGE_DEASSOC_OFFSET      6
+#define CREG_HA_RAT_FILTER_L1_MANAGE_DETECT_REQ_OFFSET   7
+#define CREG_HA_RAT_FILTER_L1_MANAGE_DETECT_REP_OFFSET   8
+#define CREG_HA_RAT_FILTER_L1_MANAGE_AUTH_OFFSET         9
+#define CREG_HA_RAT_FILTER_L1_MANAGE_DEAUTH_OFFSET       10
+#define CREG_HA_RAT_FILTER_L1_MANAGE_OTHER_OFFSET        11
+// USR subtypes
+#define CREG_HA_RAT_FILTER_L1_USR_DC_OFFSET              16
+#define CREG_HA_RAT_FILTER_L1_USR_HA_MERCURY_OFFSET      17
+#define CREG_HA_RAT_FILTER_L1_USR_HA_EHBEACON_OFFSET     18
+#define CREG_HA_RAT_FILTER_L1_USR_HA_DATA_OFFSET         19
+#define CREG_HA_RAT_FILTER_L1_USR_RESERVE0_OFFSET        20
+#define CREG_HA_RAT_FILTER_L1_USR_RESERVE1_OFFSET        21
+
+// ---- L2-Reg0: TOUCH/MR/NMR + THIS_LDC + FC_USR, bits[31:28] UPDATE_VALID ----
+#define CREG_HA_RAT_FILTER_L2_THIS_LDC_OFFSET        0
+#define CREG_HA_RAT_FILTER_L2_TOUCH0_OFFSET          1
+#define CREG_HA_RAT_FILTER_L2_MR0_OFFSET             2
+#define CREG_HA_RAT_FILTER_L2_NMR0_OFFSET            4
+#define CREG_HA_RAT_FILTER_L2_TOUCH1_OFFSET          6
+#define CREG_HA_RAT_FILTER_L2_MR1_OFFSET             7
+#define CREG_HA_RAT_FILTER_L2_NMR1_OFFSET            9
+#define CREG_HA_RAT_FILTER_L2_TOUCH2_OFFSET          11
+#define CREG_HA_RAT_FILTER_L2_MR2_OFFSET             12
+#define CREG_HA_RAT_FILTER_L2_NMR2_OFFSET            14
+#define CREG_HA_RAT_FILTER_L2_FC_USR_OFFSET          16
+
+// ---- 预定义过滤器配置值 ----
+
+// 屏蔽所有帧 (PS未就绪时使用)
+// L0=0 → 无分类使能, l0_match 恒为0 → 所有帧在 L0 被丢弃
+// TOUCH0/1/2 全部设为 DISABLE 作保险 (L0 已截断, L2 不可达)
+#define CREG_HA_RAT_FILTER_BLOCKALL_L0_VAL      0u
+#define CREG_HA_RAT_FILTER_BLOCKALL_L1_CFG0_VAL 0u
+#define CREG_HA_RAT_FILTER_BLOCKALL_L1_CFG1_VAL 0u
+#define CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG0_VAL ( \
+    (0u << CREG_HA_RAT_FILTER_L2_THIS_LDC_OFFSET)  | \
+    (1u << CREG_HA_RAT_FILTER_L2_TOUCH0_OFFSET)    | \
+    (FILTER_MR_NMR_FAIL << CREG_HA_RAT_FILTER_L2_MR0_OFFSET)   | \
+    (FILTER_MR_NMR_FAIL << CREG_HA_RAT_FILTER_L2_NMR0_OFFSET)  | \
+    (1u << CREG_HA_RAT_FILTER_L2_TOUCH1_OFFSET)    | \
+    (FILTER_MR_NMR_FAIL << CREG_HA_RAT_FILTER_L2_MR1_OFFSET)   | \
+    (FILTER_MR_NMR_FAIL << CREG_HA_RAT_FILTER_L2_NMR1_OFFSET)  | \
+    (1u << CREG_HA_RAT_FILTER_L2_TOUCH2_OFFSET)    | \
+    (FILTER_MR_NMR_FAIL << CREG_HA_RAT_FILTER_L2_MR2_OFFSET)   | \
+    (FILTER_MR_NMR_FAIL << CREG_HA_RAT_FILTER_L2_NMR2_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_BSSID_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_FC_OFFSET)     | \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_ADDR2_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_ADDR1_OFFSET) )     /* v2.1 */
+#define CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG1_VAL 0u
+#define CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG2_VAL 0u
+#define CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG3_VAL 0u
+#define CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG4_VAL 0u   // v2.1
+#define CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG5_VAL 0u   // v2.1
+
+// 默认过滤器 (匹配旧 ANOS_HA_RAT_FILTER_FLAG 行为)
+// L0: EN_CTRL | EN_DATA | EN_MANAGE
+// L1: CTRL PS_POLL | DATA BROADCAST/MULTICAST/SELF_MAC | MANAGE BEACON/DETECT_REQ/DETECT_REP
+// L2: THIS_LDC=1 透传 (ADDR1/ADDR2/FC_USR=0 未使用, 不做地址过滤)
+#define CREG_HA_RAT_FILTER_DEFAULT_L0_VAL ( \
+    (0u << CREG_HA_RAT_FILTER_L0_ALL_DC_OFFSET)    | \
+    (1u << CREG_HA_RAT_FILTER_L0_EN_CTRL_OFFSET)   | \
+    (1u << CREG_HA_RAT_FILTER_L0_EN_DATA_OFFSET)   | \
+    (1u << CREG_HA_RAT_FILTER_L0_EN_MANAGE_OFFSET) | \
+    (0u << CREG_HA_RAT_FILTER_L0_EN_USR_OFFSET) )
+
+#define CREG_HA_RAT_FILTER_DEFAULT_L1_CFG0_VAL ( \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_DC_OFFSET)        | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_RTS_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_CTS_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_ACK_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_BAR_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_MTID_BAR_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_BA_OFFSET)        | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_MTID_BA_OFFSET)   | \
+    (1u << CREG_HA_RAT_FILTER_L1_CTRL_PS_POLL_OFFSET)   | \
+    (0u << CREG_HA_RAT_FILTER_L1_CTRL_CF_ABOUT_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L1_DATA_DC_OFFSET)        | \
+    (1u << CREG_HA_RAT_FILTER_L1_DATA_BROADCAST_OFFSET) | \
+    (1u << CREG_HA_RAT_FILTER_L1_DATA_MULTICAST_OFFSET) | \
+    (1u << CREG_HA_RAT_FILTER_L1_DATA_SELF_MAC_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L1_DATA_UNIQUE_MAC_OFFSET)| \
+    (0u << CREG_HA_RAT_FILTER_L1_DATA_UNICAST_OFFSET) )
+
+#define CREG_HA_RAT_FILTER_DEFAULT_L1_CFG1_VAL ( \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_DC_OFFSET)          | \
+    (1u << CREG_HA_RAT_FILTER_L1_MANAGE_BEACON_OFFSET)      | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_ASSOC_REQ_OFFSET)   | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_ASSOC_REP_OFFSET)   | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_REASSOC_REQ_OFFSET) | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_REASSOC_REP_OFFSET) | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_DEASSOC_OFFSET)     | \
+    (1u << CREG_HA_RAT_FILTER_L1_MANAGE_DETECT_REQ_OFFSET)  | \
+    (1u << CREG_HA_RAT_FILTER_L1_MANAGE_DETECT_REP_OFFSET)  | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_AUTH_OFFSET)        | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_DEAUTH_OFFSET)      | \
+    (0u << CREG_HA_RAT_FILTER_L1_MANAGE_OTHER_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L1_USR_DC_OFFSET)             | \
+    (0u << CREG_HA_RAT_FILTER_L1_USR_HA_MERCURY_OFFSET)     | \
+    (0u << CREG_HA_RAT_FILTER_L1_USR_HA_EHBEACON_OFFSET)    | \
+    (0u << CREG_HA_RAT_FILTER_L1_USR_HA_DATA_OFFSET)        | \
+    (0u << CREG_HA_RAT_FILTER_L1_USR_RESERVE0_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L1_USR_RESERVE1_OFFSET) )
+
+// L2: THIS_LDC=1 透传 (旁路全部子判定), 以下 TOUCH* 配置在 THIS_LDC=0 时生效:
+//     TOUCH0=1 MR0=PASS NMR0=FAIL → L0 帧大类不匹配则 FAIL
+//     TOUCH1=1 MR1=PASS NMR1=FAIL → L1 子类型不命中则 FAIL
+//     TOUCH2=0 (DONTTOUCH) + EN_*=0 → L2 不参与判定
+//     (ADDR1/ADDR2/FC_USR/BSSID=0 时 THIS_LDC=1 确保 L2 不误杀)
+#define CREG_HA_RAT_FILTER_DEFAULT_L2_CFG0_VAL ( \
+    (1u << CREG_HA_RAT_FILTER_L2_THIS_LDC_OFFSET)    | \
+    (1u << CREG_HA_RAT_FILTER_L2_TOUCH0_OFFSET)      | \
+    (FILTER_MR_NMR_SUCCESS << CREG_HA_RAT_FILTER_L2_MR0_OFFSET)  | \
+    (FILTER_MR_NMR_FAIL    << CREG_HA_RAT_FILTER_L2_NMR0_OFFSET) | \
+    (1u << CREG_HA_RAT_FILTER_L2_TOUCH1_OFFSET)      | \
+    (FILTER_MR_NMR_SUCCESS << CREG_HA_RAT_FILTER_L2_MR1_OFFSET)  | \
+    (FILTER_MR_NMR_FAIL    << CREG_HA_RAT_FILTER_L2_NMR1_OFFSET) | \
+    (0u << CREG_HA_RAT_FILTER_L2_TOUCH2_OFFSET)      | \
+    (0u << CREG_HA_RAT_FILTER_L2_MR2_OFFSET)          | \
+    (0u << CREG_HA_RAT_FILTER_L2_NMR2_OFFSET)         | \
+    (0u << CREG_HA_RAT_FILTER_L2_FC_USR_OFFSET)       | \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_BSSID_OFFSET)     | /* v2.1: 默认不启用 BSSID 过滤 */ \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_FC_OFFSET)        | /* v2.1: 默认不启用 FC 过滤 */ \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_ADDR2_OFFSET)     | /* v2.1: 默认不启用 ADDR2 过滤 */ \
+    (0u << CREG_HA_RAT_FILTER_L2_EN_ADDR1_OFFSET) )       /* v2.1: 默认不启用 ADDR1 过滤 */
+
+#define CREG_HA_RAT_FILTER_DEFAULT_L2_CFG1_VAL 0u
+#define CREG_HA_RAT_FILTER_DEFAULT_L2_CFG2_VAL 0u
+#define CREG_HA_RAT_FILTER_DEFAULT_L2_CFG3_VAL 0u
+#define CREG_HA_RAT_FILTER_DEFAULT_L2_CFG4_VAL 0u   // v2.1: 默认 BSSID=0 (不启用)
+#define CREG_HA_RAT_FILTER_DEFAULT_L2_CFG5_VAL 0u   // v2.1: 默认 BSSID=0 + UV=0
+
+// TX_RESULT Register (修改过 未更新) (old)
+
+// #define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_OFFSET      (4)
+// #define CREG_HA_RAT_XPU_TX_RESULT_RETRANS_NUM_OFFSET    (0)
+// #define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_MASK    (0x00000010)
+// #define CREG_HA_RAT_XPU_TX_RESULT_RETRANS_NUM_MASK  (0x0000000F)
+
+// (new)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_1_OFFSET (0)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_2_OFFSET (5)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_3_OFFSET (10)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_4_OFFSET (15)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_5_OFFSET (20)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_6_OFFSET (25)
+
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_1_MASK (0x0000001F)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_2_MASK (0x000003E0)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_3_MASK (0x00007C00)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_4_MASK (0x000F8000)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_5_MASK (0x01F00000)
+#define CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_6_MASK (0x3E000000)
+
+// runtime mask
+#define CREG_HA_RAT_XPU_RUNTIME_VAL_HIGH_OFFSET (32)
+
+//* CSMA tx intf(Tx) 寄存器定义
+
+#define CREG_HA_RAT_TX_INTF_REG_BASE_ADDR (XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_TX_INTF_BASEADDR)
+
+// [GEMINI_UPDATE]: Updated to match latest Linux side config (hw_def.h/low_mac.c)
+#define CREG_HA_RAT_TX_INTF_REG_RESET                   (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x00)
+#define CREG_HA_RAT_TX_INTF_REG_MIXER_CFG               (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x04)
+#define CREG_HA_RAT_TX_INTF_REG_WIFI_TX_MODE            (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x08)
+#define CREG_HA_RAT_TX_INTF_REG_IQ_SRC_SEL              (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x0C)
+#define CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG       (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x10) // [GEMINI_UPDATE]: Legacy name for compatibility, same as START_TRANS_TO_PS_MODE
+#define CREG_HA_RAT_TX_INTF_REG_START_TRANS_TO_PS_MODE  (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x10)
+#define CREG_HA_RAT_TX_INTF_REG_RTS_CTS_TOSELF_WAIT_SIFS_TOP   (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x14)
+#define CREG_HA_RAT_TX_INTF_REG_SEND_CTS_TOSELF_WAIT_SIFS_TOP  (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x14) // [GEMINI_UPDATE]: Alias for legacy name compatibility
+#define CREG_HA_RAT_TX_INTF_REG_MISC_SEL                (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x18)
+#define CREG_HA_RAT_TX_INTF_REG_NUM_DMA_SYMBOL_TO_PS    (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x1C)
+#define CREG_HA_RAT_TX_INTF_REG_CFG_DATA_TO_ANT         (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x20)
+#define CREG_HA_RAT_TX_INTF_REG_TX_HOLD_THRESHOLD       (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x24)
+#define CREG_HA_RAT_TX_INTF_REG_BB_GAIN                 (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x28)
+#define CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL           (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x2C)
+#define CREG_HA_RAT_TX_INTF_REG_MAC_ADDR1_LOW32         (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x30)
+#define CREG_HA_RAT_TX_INTF_REG_MAC_ADDR1_HIGH16        (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x34)
+#define CREG_HA_RAT_TX_INTF_REG_PKT_INFO                (CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x44)
+
+
+//* CSMA tx intf(Tx) 掩码定义
+
+// Tx Intf Reset
+#define CREG_HA_RAT_TX_INTF_REG_RESET_MASK (0xFFFFFFFF)
+
+// // WIFI_TX_MODE Register
+// #define CREG_HA_RAT_TX_INTF_WIFI_TX_MODE_PHY_TX_AUTO_START_MODE_OFFSET				(3)
+// #define CREG_HA_RAT_TX_INTF_WIFI_TX_MODE_PHY_TX_AUTO_START_NUM_DMA_SYMBOL_TH_OFFSET (4)
+// #define CREG_HA_RAT_TX_INTF_WIFI_TX_MODE_PHY_TX_AUTO_START_MODE_MASK            	(0x00000008)
+// #define CREG_HA_RAT_TX_INTF_WIFI_TX_MODE_PHY_TX_AUTO_START_NUM_DMA_SYMBOL_TH_MASK 	(0x00003FF0)
+
+// CTS_TOSELF_CONFIG Register
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ENABLE_OFFSET		(31)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_OFFSET 	(30)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_DURATION_OFFSET 	(8)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_BY_MAC80211_OFFSET    (4)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ACTUAL_TRAFFIC_PKT_RATE_OFFSET (0)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ENABLE_MASK                   (0x80000000)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_MASK                 (0x40000000)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_DURATION_MASK                 (0x00FFFF00)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_BY_MAC80211_MASK     (0x000000F0)
+#define CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ACTUAL_TRAFFIC_PKT_RATE_MASK  (0x0000000F)
+// SEND_CTS_TOSELF_WAIT_SIFS_TOP Register
+#define CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_5GHz_OFFSET 		(16)
+#define CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_2dot4GHz_OFFSET 	(0)
+#define CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_5GHz_MASK        (0x3FFF0000)
+#define CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_2dot4GHz_MASK    (0x00003FFF)
+// [GEMINI_DELETE]: Obsolete DMA_SYMBOL_TO_PL macros
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_PHY_TX_SN_OFFSET 				(21)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_TX_QUEUE_IDX_FROM_PS_OFFSET 	(18)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_TX_PKT_RETRY_LIMIT_HW_OFFSET	(14)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_TX_PKT_NEED_ACK_OFFSET 		(13)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_NUM_DMA_SYMBOL_OFFSET 			(0)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_PHY_TX_SN_MASK 			(0xFFF00000)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_TX_QUEUE_IDX_FROM_PS_MASK 	(0x000C0000)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_TX_PKT_RETRY_LIMIT_HW_MASK (0x0003C000)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_TX_PKT_NEED_ACK_MASK 		(0x00002000)
+// #define CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_NUM_DMA_SYMBOL_MASK 		(0x00001FFF)
+
+// INTERRUPT_SEL Register
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_ENABLE_OFFSET (16)
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_ENABLE_OFFSET (17)
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_MODE_OFFSET (0)
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_MODE_OFFSET (4)
+
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_DISABLE_MASK    (0x00010000)
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_DISABLE_MASK    (0x00020000)
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_MODE_MASK       (0x00000007)
+#define CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_MODE_MASK       (0x00000070)
+// PKT_INFO Register
+#define CREG_HA_RAT_TX_INTF_PKT_INFO_TX_QUEUE_IDX_OFFSET 		(28)
+#define CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_SN_OFFSET 			(16)
+#define CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_NUM_DMA_BYTE_OFFSET (0)
+#define CREG_HA_RAT_TX_INTF_PKT_INFO_TX_QUEUE_IDX_MASK          (0x70000000)
+#define CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_SN_MASK             (0x0FFF0000)
+#define CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_NUM_DMA_BYTE_MASK   (0x0000FFFF)
+
+//* CSMA rx intf(Rx) 寄存器定义 // [GEMINI_UPDATE]: Updated to match latest Linux side config (hw_def.h/low_mac.c)
+
+#define CREG_HA_RAT_RX_INTF_REG_BASE_ADDR (XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_RX_INTF_BASEADDR)
+
+#define CREG_HA_RAT_RX_INTF_REG_RESET       				(CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x00)
+#define CREG_HA_RAT_RX_INTF_REG_AUTO_RST_WAIT_TIME          (CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x04)
+#define CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_MODE 		(CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x14)
+#define CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS 			(CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x18)
+#define CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_SRC_SEL 	(CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x1C)
+#define CREG_HA_RAT_RX_INTF_REG_NUM_DMA_SYMBOL_TO_PS 		(CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x24)
+#define CREG_HA_RAT_RX_INTF_REG_TLAST_TIMEOUT_TOP 			(CREG_HA_RAT_RX_INTF_REG_BASE_ADDR + 0x30)
+
+
+
+//* CSMA rx intf(Rx) 掩码定义
+
+// RESET Register
+// #define CREG_HA_RAT_RX_INTF_RX_INTF_M_AXIS_RESET_OFFSET 		(4)
+#define CREG_HA_RAT_RX_INTF_RX_INTF_M_AXIS_RESET_MASK			(0xFFFFFFFF)
+// START_TRANS_TO_PS_MODE Register
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_ENDLESS_OFFSET 						(9)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_NUM_DMA_SYMBOL_TO_PS_SEL_OFFSET 		(5)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_SOURCE_OF_MAXIS_TRANS_TRIGGER_OFFSET (0)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_ENDLESS_MASK 						(0x00000200)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_NUM_DMA_SYMBOL_TO_PS_SEL_MASK 		(0x00000020)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_SOURCE_OF_MAXIS_TRANS_TRIGGER_MASK 	(0x00000007)
+// START_TRANS_TO_PS Register
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_START_1TRANS_EXT_TRIGGER_OFFSET 	(0)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_START_1TRANS_EXT_TRIGGER_MASK 	(0x00000001)
+// START_TRANS_TO_PS_SRC_SEL Register
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_SRC_SEL_OFFSET 	(0)
+#define CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_SRC_SEL_MASK 		(0x00000001)
+// NUM_DMA_SYMBOL
+#define CREG_HA_RAT_RX_INTF_NUM_DMA_SYMBOL_TO_PS_OFFSET (0)
+#define CREG_HA_RAT_RX_INTF_NUM_DMA_SYMBOL_TO_PS_MASK (0x00001FFF)
+// TLAST_TIMEOUT_TOP Register
+#define CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_AUTO_RECOVER_DISABLE_OFFSET 	(31)
+#define CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_TIMEOUT_US_OFFSET 			(0)
+#define CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_AUTO_RECOVER_DISABLE_MASK 	(0x80000000)
+#define CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_TIMEOUT_US_MASK 				(0x00001FFF)
+
+
+#define HA_RAT_MAC_ADDR {0xcc, 0xcc, 0xcc, 0x66, 0xb5, 0x89}
+
+/**
+ * @brief 写寄存器宏
+ * @param register 寄存器地址
+ * @param value 写入的32位值
+ */
+#define rat_write_reg(register, value) XBSP_CReg_WriteReg32((anos_xreg32_t *)(register), (anos_xreg32_t)value)
+
+/**
+ * @brief 读寄存器宏
+ * @param register 寄存器地址
+ * @return 读取的32位寄存器值
+ */
+#define rat_read_reg(register) XBSP_CReg_ReadReg32((anos_xreg32_t *)register)
+
+/**
+ * @brief 读取寄存器指定位
+ * @param register 寄存器地址
+ * @param bit 位掩码
+ * @return 读取的位状态(0或非0)
+ */
+#define rat_read_bit(register, bit) XBSP_CReg_ReadBit32((anos_xreg32_t *)register, (anos_xreg32_t)bit)
+
+/**
+ * @brief 设置寄存器指定位
+ * @param register 寄存器地址
+ * @param bit 位掩码
+ * @return 设置位状态(置1)
+ */
+#define rat_set_bit(register, bit) XBSP_CReg_SetBit32((anos_xreg32_t *)register, (anos_xreg32_t)bit)
+
+/**
+ * @brief 清除寄存器指定位
+ * @param register 寄存器地址
+ * @param bit 位掩码
+ * @return 清除位状态(置0)
+ */
+#define rat_clear_bit(register, bit) XBSP_CReg_ClearBit32((anos_xreg32_t *)register, (anos_xreg32_t)bit)
+
+
+/*-------------------------------------------------------*\
+                   Enum/Union/Struct
+\*-------------------------------------------------------*/
+
+/**
+ * @brief CSMA Time Debug type
+ *
+ */
+
+ typedef enum anos_ha_rat_time_debug
+ {
+    e_debug_sig_time = 0,
+    e_debug_ofdm_symbol_time = 1,
+    e_debug_slot_time = 2,
+    e_debug_sifs_time = 3,
+    e_debug_rx_start_time = 4
+
+ } anos_ha_rat_time_debug_t;
+
+ /**
+ * @brief CSMA AIFS ACx type
+ *
+ */
+
+ typedef enum anos_ha_rat_aifs_ac
+ {
+    e_AC1 = 1,
+    e_AC2,
+    e_AC3,
+    e_AC4,
+    e_ACHP
+
+ } anos_ha_rat_aifs_ac_t;
+
+
+/**
+ * @brief CSMA_TEST_DATA_LEN for send test
+ *
+ */
+#define CSMA_TEST_DATA_LEN (120)
+
+    enum frequency_band
+    {
+        BAND_900M = 0,
+        BAND_2_4GHZ,
+        BAND_3_65GHZ,
+        BAND_5_0GHZ,
+        BAND_5_8GHZ,
+        BAND_5_9GHZ,
+        BAND_60GHZ
+    };
+
+    // reg [1:0] rts_cts_select // 0:no rts or cts  1:cts_to_self  2:rts/cts
+    // reg cts_use_traffic_rate
+    // reg [4:0] wave_type_def
+    // reg [15:0] cts_duration
+    // reg [3:0] cts_rate_signal_value
+    // reg [3:0] rate_signal_value
+    /**
+     * @brief 配置寄存器
+     * @param m_rate_signal_value
+     * @param m_cts_rate_signal_value
+     * @param m_duration
+     * @param m_waveType
+     * @param m_cts_use_traffic_rate
+     * @param m_rts_cts_select // 0:no rts or cts  1:cts_to_self  2:rts/cts
+     * @return None
+     * @note 未测试
+     */
+    typedef struct
+    {
+        uint32_t m_rate_signal_value : 4;
+        uint32_t m_cts_rate_signal_value : 4;
+        uint32_t m_duration : 16;
+        uint32_t m_waveType : 5;
+        uint32_t m_cts_use_traffic_rate : 1;
+        uint32_t m_rts_cts_select : 2; // 0:no rts or cts  1:cts_to_self  2:rts/cts
+    } __anos_packed cts_rts_config_t;
+
+    // tx_interface slv_reg 8
+    //  reg [10:0]phy_tx_sn
+    //  reg [2:0] queue_idx
+    //  reg [3:0] retry_limit_nums
+    //  reg pkt_need_ack
+    //  reg [12:0] num_dma_symbol
+    /**
+     * @brief 配置寄存器
+     * @param m_num_dma_symbol
+     * @param m_pkt_need_ack
+     * @param m_retry_limit_nums
+     * @param m_queue_idx
+     * @param m_phy_tx_sn //
+     * @return None
+     * @note 未测试
+     */
+    typedef struct
+    {
+        uint32_t m_num_dma_symbol : 13;
+        uint32_t m_pkt_need_ack : 1;
+        uint32_t m_retry_limit_nums : 4;
+        uint32_t m_queue_idx : 3;
+        uint32_t m_phy_tx_sn : 11;
+    } __anos_packed num_dma_symble_to_pl_t;
+
+    /**
+     * @brief 配置寄存器
+     * @param m_duration
+     * @param m_queue_index
+     * @param notuse
+     * @param m_posedge_valid
+     * @return None
+     * @note 未测试
+     */
+    typedef struct
+    {
+        uint32_t m_duration : 16;
+        uint32_t m_queue_index : 3;
+        uint32_t notuse : 13; // 全为零
+    } __anos_packed HighPriorityQueueENc_t;
+
+    /**
+     * @brief 配置寄存器
+     * @param m_cts_rts_config;
+     * @param m_num_dma_symble_to_pl
+     * @param m_HighPriorityQueueENc
+     * @return None
+     * @note 未测试
+     */
+    typedef struct
+    {
+        cts_rts_config_t m_cts_rts_config;
+        num_dma_symble_to_pl_t m_num_dma_symble_to_pl;
+        HighPriorityQueueENc_t m_HighPriorityQueueENc;
+    } csma_ctl_info_t;
+
+    /*-------------------------------------------------------*\
+                Referential function definition
+    \*-------------------------------------------------------*/
+
+    //* XPU
+
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg0; // rst
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg1; // some source selection
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg2; // tsf load value low
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg3; // tsf load value high (the rising edge of msb will trigger loading)
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg4; // 19:16 band; 15:0 channel
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg5; // cwmin1:slv_reg5[11:0]  cwmin2:slv_reg5[23:12] 
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg6; // cwmin3:slv_reg6[11:0]  cwmin4:slv_reg6[23:12]
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg7; // rssi report offset, and gpio delay ctrl for rssi calculation, and reset the fifo delay // t_bug 32bits 全为 PS 向下写的端口如何上报？？？？？
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg8; // lbt rssi threshold
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg9; // xIFS and slot time override for debug
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg10; // tx bb RF delay in number of clock
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg11; // max number of tx re-transmission
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg12; // cwmin5:slv_reg6[11:0] cwmin6:slv_reg6[23:12]
+    // //wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg13; // 
+    // //wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg14; // 
+    // //wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg15; //
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg16; // AIFS_ACx\ps_adjust_time
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg17; // receive ack time count top -- 5GHz
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg18; // before actual ack sending, wait until counter reach this value -- related to SIFS in different band. low 16bit 2.4GHz, high 16bit 5GHz
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg19; // nav_enable:[31] aifs_enable:[30] eifsAC_enable:[29]   cwmin1:slv_reg19[11:0]
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg20; // slice 0 count_total
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg21; // slice 0 count_start
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg22; // slice 0 count_end
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg23; // slice 1 count_total
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg24; // slice 1 count_start
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg25; // slice 1 count_end
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg26; // extra duration in CTS frame (response to RTS)
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg27; // filter flags
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg28; // self bssid and filter enable
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg29; // self bssid and filter enable
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg30; // mac addr and filter enable
+    // wire [(C_S00_AXI_DATA_WIDTH-1):0] slv_reg31; // mac addr and filter enable
+
+
+    ANOS_INLINE void anos_cfg_reg(uint32_t f_reg_addr, uint32_t f_value, uint32_t f_reg_mask, uint32_t f_reg_offset){
+        uint32_t value_cfg;
+        uint32_t reg_value;
+        reg_value = rat_read_reg(f_reg_addr);
+
+        reg_value = reg_value & (~f_reg_mask);
+
+        value_cfg = ((uint32_t)f_value << f_reg_offset) & f_reg_mask;
+
+		reg_value = (reg_value | value_cfg);
+
+        rat_write_reg(f_reg_addr, reg_value);
+    }
+
+    ANOS_INLINE uint32_t anos_get_reg_value(uint32_t f_reg_addr, uint32_t f_reg_mask, uint32_t f_reg_offset){
+        uint32_t reg_value;
+
+        reg_value = rat_read_reg(f_reg_addr);
+
+        return ((reg_value & f_reg_mask) >> f_reg_offset);
+    }
+
+
+    /** 
+     * @brief 混合接入 RAT XPU 软复位(无效)
+     * @return void
+     * @note (无效)
+     */
+    ANOS_INLINE void ANOS_RAT_XPU_Soft_Do_Reset(void){
+        rat_write_reg(CREG_HA_RAT_XPU_REG_RESET, CREG_HA_RAT_XPU_RESET_MASK);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT XPU 清除软复位(无效)
+     * @return void
+     * @note (无效)
+     */
+    ANOS_INLINE void ANOS_RAT_XPU_Soft_Undo_Reset(void){
+        rat_write_reg(CREG_HA_RAT_XPU_REG_RESET, 0);
+        return;
+    }
+
+    /* CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x04 该 32 bits 寄存器并未使用*/
+
+    /** 
+     * @brief 配置混合接入 RAT TSF 值
+     * @param f_tsf_load_low uint32_t
+     *        有效参数: 
+     *        - \b 非空
+     * @param f_tsf_load_high uint32_t
+     *        有效参数: 
+     *        - \b 非空
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_TSF_Load_Value(uint32_t f_tsf_load_low, uint32_t f_tsf_load_high){
+        rat_write_reg(CREG_HA_RAT_XPU_REG_TSF_LOAD_VAL_LOW, f_tsf_load_low);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_TSF_LOAD_VAL_HIGH, f_tsf_load_high);
+        rat_set_bit(CREG_HA_RAT_XPU_REG_TSF_LOAD_VAL_HIGH, CREG_HA_RAT_XPU_TSF_LOAD_VAL_SET_OFFSET);
+        rat_clear_bit(CREG_HA_RAT_XPU_REG_TSF_LOAD_VAL_HIGH, CREG_HA_RAT_XPU_TSF_LOAD_VAL_SET_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT erp_short_slot 使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Erp_Short_Slot_Enable(void){
+        rat_set_bit(CREG_HA_RAT_XPU_REG_BAND_CHANNEL, CREG_HA_RAT_XPU_BAND_CHANNEL_ERP_SHORT_SLOT_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT erp_short_slot 除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Erp_Short_Slot_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_XPU_REG_BAND_CHANNEL, CREG_HA_RAT_XPU_BAND_CHANNEL_ERP_SHORT_SLOT_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT Band
+     * @param f_band uint8_t
+     *        有效参数: 
+     *        - \b 有效范围 0x00 ~ 0x0F
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Band(uint8_t f_band){
+        
+        uint32_t band_cfg;
+        uint32_t reg_value;
+
+        band_cfg = (((uint32_t)f_band) << CREG_HA_RAT_XPU_BAND_CHANNEL_BAND_OFFSET) & CREG_HA_RAT_XPU_BAND_CHANNEL_BAND_MASK;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_BAND_CHANNEL);
+
+        reg_value = reg_value & (~CREG_HA_RAT_XPU_BAND_CHANNEL_BAND_MASK);
+
+		reg_value = (band_cfg | reg_value);
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_BAND_CHANNEL, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT Channel
+     * @param f_channel uint16_t
+     *        - \b 有效范围 0x0000 ~ 0xFFFF
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Channel(uint16_t f_channel){
+
+        uint32_t channel_cfg;
+        uint32_t reg_value;
+
+        channel_cfg = (((uint32_t)f_channel) << CREG_HA_RAT_XPU_BAND_CHANNEL_CHANNEL_OFFSET) & CREG_HA_RAT_XPU_BAND_CHANNEL_CHANNEL_MASK;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_BAND_CHANNEL);
+
+        reg_value = reg_value & (~CREG_HA_RAT_XPU_BAND_CHANNEL_CHANNEL_MASK);
+
+		reg_value = (channel_cfg | reg_value);
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_BAND_CHANNEL, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT CW Min
+     * @param f_cw_min uint16_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0000 ~ 0x0FFF
+     * @param f_cw_index uint_t
+     *        有效参数: 
+     *        - \b 有效范围 0x1 ~ 0x6
+     * @return 
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_CW_Min(uint16_t f_cw_min, uint8_t f_cw_index){
+        // [GEMINI_UPDATE]: Updated to match latest Linux side config (hw_def.h/low_mac.c)
+        uint32_t cw_min_cfg;
+        uint32_t reg_value;
+        uint32_t reg_addr = CREG_HA_RAT_XPU_REG_CW_MIN_ADDR;
+        uint32_t reg_mask;
+        uint32_t reg_offset;
+
+        ANOS_DASSERT((  f_cw_index != 0),
+                        "ERR: no such cw index : 0 !\n\r",
+                        ANOS_NULL);
+
+        ANOS_DASSERT(   (f_cw_index <= 6),
+                        "ERR: cw index must less than 6 !\n\r",
+                        ANOS_NULL);
+
+        switch (f_cw_index){
+            case 1:{
+                reg_mask = CREG_HA_RAT_XPU_CW1_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CW1_OFFSET;
+                break;
+            }
+            case 2:{
+                reg_mask = CREG_HA_RAT_XPU_CW2_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CW2_OFFSET;
+                break;
+            }
+            case 3:{
+                reg_mask = CREG_HA_RAT_XPU_CW3_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CW3_OFFSET;
+                break;
+            }
+            case 4:{
+                reg_mask = CREG_HA_RAT_XPU_CW4_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CW4_OFFSET;
+                break;
+            }
+            case 5:{
+                reg_mask = CREG_HA_RAT_XPU_CW5_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CW5_OFFSET;
+                break;
+            }
+            case 6:{
+                reg_mask = CREG_HA_RAT_XPU_CW6_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CW6_OFFSET;
+                break;
+            }
+            default:{
+                LOCAL_PRINTF("ERR: wrong cw index !\n\r");
+                return;
+            }
+        }
+        
+        reg_value = rat_read_reg(reg_addr);
+
+        reg_value = reg_value & (~reg_mask);
+
+        cw_min_cfg = (((uint32_t)f_cw_min) << reg_offset) & reg_mask;
+
+		reg_value = (cw_min_cfg | reg_value);
+
+        rat_write_reg(reg_addr, reg_value);
+
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT RSSI(dB)
+     * @param f_rssdi_dB uint16_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0000 ~ 0x07FF
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_RSSI_dB(uint16_t f_rssdi_dB){
+        
+
+        uint32_t rssi_dB_cfg;
+        uint32_t reg_value;
+
+        
+        rssi_dB_cfg = (((uint32_t)f_rssdi_dB) << CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_HALF_DB_OFFSET_OFFSET) & CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_HALF_DB_OFFSET_MASK;
+        
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_RSSI_DB_CFG);
+
+        reg_value = reg_value & (~CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_HALF_DB_OFFSET_MASK);
+
+		reg_value = (rssi_dB_cfg | reg_value);
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_RSSI_DB_CFG, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT RSSI delay
+     * @param f_delay uint8_t
+     *        有效参数: 
+     *        - \b 有效范围 0x00 ~ 0x7f
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_RSSI_Delay(uint8_t f_delay){
+        
+        uint32_t delay_cfg;
+        uint32_t reg_value;
+
+        delay_cfg = (((uint32_t)f_delay) << CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_DELAY_CTL_OFFSET) & CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_DELAY_CTL_MASK;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_RSSI_DB_CFG);
+
+        reg_value = reg_value & (~CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_DELAY_CTL_MASK);
+
+		reg_value = (delay_cfg | reg_value);
+
+        rat_write_reg (CREG_HA_RAT_XPU_REG_RSSI_DB_CFG, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT RSSI FIFO 延迟复位
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_RSSI_FIFO_Delay_Do_Reset(void){
+        rat_set_bit(CREG_HA_RAT_XPU_REG_RSSI_DB_CFG, CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_FIFO_DELAY_RSTN_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT RSSI FIFO 延迟复位清除
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_RSSI_FIFO_Delay_Undo_Reset(void){
+        rat_clear_bit(CREG_HA_RAT_XPU_REG_RSSI_DB_CFG, CREG_HA_RAT_XPU_RSSI_DB_CFG_RSSI_FIFO_DELAY_RSTN_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT RSSI 门限
+     * @param uint16_t f_threshold
+     *        有效参数: 
+     *        - \b 有效范围 0x0000 ~ 0x07FF
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_RSSI_Threshold(uint16_t f_threshold){
+        
+        uint32_t threshold_cfg;
+
+        threshold_cfg = (((uint32_t)f_threshold) << CREG_HA_RAT_XPU_LBT_TH_CCA_RSSI_HALF_DB_TH_OFFSET) & CREG_HA_RAT_XPU_LBT_TH_CCA_RSSI_HALF_DB_TH_MASK;
+        
+        rat_write_reg(CREG_HA_RAT_XPU_REG_LBT_TH, threshold_cfg);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT Time debug
+     * @param anos_ha_rat_time_debug_t f_type
+     *        有效参数: 
+     *        - \b e_debug_sig_time
+     *        - \b e_debug_ofdm_symbol_time
+     *        - \b e_debug_slot_time
+     *        - \b e_debug_sifs_time
+     *        - \b e_debug_rx_start_time
+     * @param f_time uint8_t
+     *        有效参数:
+     *        - \b 非空
+     * @return None
+     * @note 未测试
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Time_Debug(anos_ha_rat_time_debug_t f_type, uint8_t f_time){
+        
+        ANOS_DASSERT(   (f_type == e_debug_sig_time ||
+                        f_type == e_debug_ofdm_symbol_time ||
+                        f_type == e_debug_slot_time ||
+                        f_type == e_debug_sifs_time ||
+                        f_type == e_debug_rx_start_time),
+                        "ERR: no such time type !\n\r",
+                        ANOS_NULL);
+
+        uint32_t time_cfg;
+        uint32_t reg_value;
+        // uint32_t reg_addr;
+        uint32_t reg_mask;
+        uint32_t reg_offset;
+
+        switch (f_type){
+            case e_debug_sig_time:{
+                reg_mask = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PREAMBLE_SIG_TIME_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PREAMBLE_SIG_TIME_OFFSET;
+                break;
+            }
+            case e_debug_ofdm_symbol_time:{
+                reg_mask = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_OFDM_SYMBOL_TIME_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_OFDM_SYMBOL_TIME_OFFSET;
+                break;
+            }
+            case e_debug_slot_time:{
+                reg_mask = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SLOT_TIME_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SLOT_TIME_OFFSET;
+                break;
+            }
+            case e_debug_sifs_time:{
+                reg_mask = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SIFS_TIME_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_SIFS_TIME_OFFSET;
+                break;
+            }
+            case e_debug_rx_start_time:{
+                reg_mask = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PHY_RX_START_DELAY_TIME_MASK;
+                reg_offset = CREG_HA_RAT_XPU_CSMA_TIME_DEBUG_PHY_RX_START_DELAY_TIME_OFFSET;
+                break;
+            }
+            default:{
+                LOCAL_PRINTF("ERR: wrong time debug type !\n\r");
+                return;
+            }
+        }
+
+        time_cfg = ((uint32_t)f_time << reg_offset) & reg_mask;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_CSMA_TIME_DEBUG);
+
+        reg_value = reg_value & (~reg_mask);
+
+		reg_value = (time_cfg | reg_value);
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_CSMA_TIME_DEBUG, reg_value);
+        return;
+    }
+    
+    /** 
+     * @brief 配置混合接入 RAT 的基带射频延迟
+     * @param f_delay uint32_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0 ~ 0xfff
+     * @return void
+     * @note 设置的延迟数值为 PL 延迟的时钟数(一般为 240M 时钟)
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_BB_RF_Delay(uint32_t f_delay){
+        uint32_t reg_value = f_delay & CREG_HA_RAT_XPU_BB_RF_DELAY_TX_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_BB_RF_DELAY, reg_value);
+        return;
+    }
+    
+    /** 
+     * @brief 配置混合接入 RAT 最大重传次数
+     * @param f_max_retrans_num uint8_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0 ~ 0xF
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_MAX_Retrans_Num(uint8_t f_max_retrans_num){
+        uint32_t reg_value = ((uint32_t)f_max_retrans_num << CREG_HA_RAT_XPU_MAX_NUM_RETRANS_OFFSET) & CREG_HA_RAT_XPU_MAX_NUM_RETRANS_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_MAX_NUM_RETRANS, reg_value);
+        return;
+    }
+
+    /* CREG_HA_RAT_XPU_REG_BASE_ADDR + 0x34 / 0x38 / 0x3c 未使用 */
+
+    /** 
+     * @brief 配置混合接入 RAT AIFS
+     * @param f_AIFS uint8_t
+     *        有效参数: 
+     *        - \b 有效范围 0x00 ~ 0xFF
+     * @param anos_ha_rat_aifs_ac_t f_ac_type
+     *        有效参数: 
+     *        - \b e_AC1
+     *        - \b e_AC2
+     *        - \b e_AC3
+     *        - \b e_AC4
+     *        - \b e_ACHP
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_AIFS_ACx(uint8_t f_AIFS, anos_ha_rat_aifs_ac_t f_ac_type){
+
+        uint32_t reg_value;
+        uint32_t reg_mask;
+        uint32_t reg_offset;
+        uint32_t AIFS_cfg;
+
+        ANOS_DASSERT((  f_ac_type == e_AC1 ||
+                        f_ac_type == e_AC2 ||
+                        f_ac_type == e_AC3 ||
+                        f_ac_type == e_AC4 ||
+                        f_ac_type == e_ACHP),
+                        "no such AIFS_AC type !\n\r",
+                        ANOS_NULL);
+
+        switch (f_ac_type){
+            case e_AC1:{
+                reg_mask = CREG_HA_RAT_XPU_AIFS_AC1_MASK;
+                reg_offset = CREG_HA_RAT_XPU_AIFS_AC1_OFFSET;
+                break;
+            }
+            case e_AC2:{
+                reg_mask = CREG_HA_RAT_XPU_AIFS_AC2_MASK;
+                reg_offset = CREG_HA_RAT_XPU_AIFS_AC2_OFFSET;
+                break;
+            }
+             case e_AC3:{
+                reg_mask = CREG_HA_RAT_XPU_AIFS_AC3_MASK;
+                reg_offset = CREG_HA_RAT_XPU_AIFS_AC3_OFFSET;
+                break;
+            }
+             case e_AC4:{
+                reg_mask = CREG_HA_RAT_XPU_AIFS_AC4_MASK;
+                reg_offset = CREG_HA_RAT_XPU_AIFS_AC4_OFFSET;
+                break;
+            }
+             case e_ACHP:{
+                reg_mask = CREG_HA_RAT_XPU_AIFS_ACHP_MASK;
+                reg_offset = CREG_HA_RAT_XPU_AIFS_ACHP_OFFSET;
+                break;
+            }
+            default:{
+                LOCAL_PRINTF("ERR: wrong AC type !\n\r");
+                return;
+            }
+        }
+
+        AIFS_cfg = ((uint32_t)f_AIFS << reg_offset) & reg_mask;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_AIFS_AC_CFG);
+
+        reg_value = reg_value & (~reg_mask);
+
+		reg_value = (AIFS_cfg | reg_value);
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_AIFS_AC_CFG, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT PS adjust time
+     * @param f_adjust_time uint16_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0000 ~ 0x0FFF
+     * @return void
+     * @note [GEMINI_UPDATE]: Fixed to use read-modify-write to protect AIFS bits
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_PS_Adjust_Time(uint16_t f_adjust_time)
+    {
+        uint32_t time_cfg;
+        uint32_t reg_value;
+
+        time_cfg = ((uint32_t)f_adjust_time << CREG_HA_RAT_XPU_PS_ADJUST_TIME_OFFSET) & CREG_HA_RAT_XPU_PS_ADJUST_TIME_MASK;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_AIFS_AC_CFG);
+        reg_value = (reg_value & ~CREG_HA_RAT_XPU_PS_ADJUST_TIME_MASK) | time_cfg;
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_AIFS_AC_CFG, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT Tx Hold Threshold
+     * @param f_threshold uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_Hold_Threshold(uint32_t f_threshold){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_TX_HOLD_THRESHOLD, f_threshold);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT Tx High Allowed SW
+     * @param f_allowed uint8_t
+     *        有效参数: 
+     *        - \b 有效范围 0x00 ~ 0x3F
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Tx_High_Allowed_SW(uint8_t f_allowed){
+        
+        uint32_t allowed_cfg;
+
+        allowed_cfg = ((uint32_t)f_allowed << CREG_HA_RAT_XPU_TX_HIGH_ALLOWED_SW_OFFSET) & CREG_HA_RAT_XPU_TX_HIGH_ALLOWED_SW_MASK;
+
+        rat_write_reg(CREG_HA_RAT_XPU_REG_TX_HIGH_ALLOWED_SW_ADDR, allowed_cfg);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 ACK wait top
+     * @param f_ack_wait_2_4G uint16_t
+     *        有效参数: 
+     *        - \b 非空
+     * @param f_ack_wait_5G uint16_t
+     *        有效参数: 
+     *        - \b 非空
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_ACK_Wait_Top(uint16_t f_ack_wait_2_4G, uint16_t f_ack_wait_5G){
+        uint32_t ack_2_4G_cfg;
+        uint32_t ack_5G_cfg;
+
+        ack_2_4G_cfg = ((uint32_t)f_ack_wait_2_4G << CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_2dot4GHz_DELAY_BEFORE_TX_OFFSET) & CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_2dot4GHz_DELAY_BEFORE_TX_MASK;
+        ack_5G_cfg = ((uint32_t) f_ack_wait_5G << CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_5GHz_DELAY_BEFORE_TX_OFFSET) & CREG_HA_RAT_XPU_SEND_ACK_WAIT_TOP_5GHz_DELAY_BEFORE_TX_MASK;
+
+        ack_5G_cfg = (ack_2_4G_cfg | ack_5G_cfg);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SEND_ACK_WAIT_TOP, ack_5G_cfg);
+        return;
+    }
+
+    /** 
+     * @brief 除能 CSMA NAV
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_NAV_Disable(void){
+        rat_set_bit(CREG_HA_RAT_XPU_REG_CSMA_CFG, CREG_HA_RAT_XPU_CSMA_CFG_NAV_DISABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 使能 CSMA NAV
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_NAV_Enable(void){
+        rat_clear_bit(CREG_HA_RAT_XPU_REG_CSMA_CFG, CREG_HA_RAT_XPU_CSMA_CFG_NAV_DISABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 使能 DIFS
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_DIFS_Enable(void){
+        rat_clear_bit(CREG_HA_RAT_XPU_REG_CSMA_CFG, CREG_HA_RAT_XPU_CSMA_CFG_DIFS_DISABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 除能 DIFS
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_DIFS_Disable(void){
+        rat_set_bit(CREG_HA_RAT_XPU_REG_CSMA_CFG, CREG_HA_RAT_XPU_CSMA_CFG_DIFS_DISABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 使能 EIFS
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_EIFS_Enable(void){
+        rat_clear_bit(CREG_HA_RAT_XPU_REG_CSMA_CFG, CREG_HA_RAT_XPU_CSMA_CFG_EIFS_DISABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 除能 EIFS
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_EIFS_Disable(void){
+        rat_set_bit(CREG_HA_RAT_XPU_REG_CSMA_CFG, CREG_HA_RAT_XPU_CSMA_CFG_EIFS_DISABLE_OFFSET);
+        return;
+    }
+
+/* [GEMINI_DELETE]: Obsolete SLICE_COUNT functions
+    ANOS_INLINE void ANOS_RAT_Cfg_Slice_Count_Total0(uint32_t f_count_total){
+        
+        uint32_t reg_value = f_count_total & CREG_HA_RAT_XPU_REG_SLICE_COUNT_TOTAL0_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SLICE_COUNT_TOTAL0, reg_value);
+        return;
+    }
+
+    ANOS_INLINE void ANOS_RAT_Cfg_Slice_Count_Start0(uint32_t f_count_start){
+
+        uint32_t reg_value = f_count_start & CREG_HA_RAT_XPU_REG_SLICE_COUNT_START0_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SLICE_COUNT_START0, reg_value);
+        return;
+    }
+    
+    ANOS_INLINE void ANOS_RAT_Cfg_Slice_Count_End0(uint32_t f_count_end){
+
+        uint32_t reg_value = f_count_end & CREG_HA_RAT_XPU_REG_SLICE_COUNT_END0_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SLICE_COUNT_END0, reg_value);
+        return;
+    }
+
+    ANOS_INLINE void ANOS_RAT_Cfg_Slice_Count_Total1(uint32_t f_count_total){
+
+        uint32_t reg_value = f_count_total & CREG_HA_RAT_XPU_REG_SLICE_COUNT_TOTAL1_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SLICE_COUNT_TOTAL1, reg_value);
+        return;
+    }
+
+    ANOS_INLINE void ANOS_RAT_Cfg_Slice_Count_Start1(uint32_t f_count_start){
+
+        uint32_t reg_value = f_count_start & CREG_HA_RAT_XPU_REG_SLICE_COUNT_START1_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SLICE_COUNT_START1, reg_value);
+        return;
+    }
+    
+    ANOS_INLINE void ANOS_RAT_Cfg_Slice_Count_End1(uint32_t f_count_end){
+
+        uint32_t reg_value = f_count_end & CREG_HA_RAT_XPU_REG_SLICE_COUNT_END1_MASK;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_SLICE_COUNT_END1, reg_value);
+        return;
+    }
+*/
+
+    /** 
+     * @brief 配置混合接入 RAT 的 XPU CTS to RTS
+     * @param f_MCS uint8_t
+     *        有效参数: 有效的 MCS 
+     *        - \b XXX // t_bug 待补充
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_CTS_To_RTS(uint8_t f_MCS){
+        uint32_t reg_value = ((uint32_t)f_MCS) << CREG_HA_RAT_XPU_CTS_TO_RTS_CONFIG_RATE_MCS_OFFSET;
+        rat_write_reg(CREG_HA_RAT_XPU_REG_CTS_TO_RTS_CONFIG, reg_value);
+        return;
+    }
+    
+    /**
+     * @brief 写7个过滤器寄存器 (带UPDATE_VALID原子锁存序列)
+     *
+     * UPDATE_VALID协议: 先写UV=0预装, 再写UV=1锁存到影子寄存器
+     *   L0/L1 各自 bit[28]=UV
+     *   L2-Reg0[31:28] 分别控制 L2-Reg3/2/1/0 的影子锁存
+     *
+     * @param l0_val   L0-Reg0: 分类使能[4:0]
+     * @param l1_cfg0  L1-Reg0: CTRL子类型[9:0] + DATA属性[21:16]
+     * @param l1_cfg1  L1-Reg1: MANAGE子类型[11:0] + USR[21:16]
+     * @param l2_cfg0  L2-Reg0: TOUCH/MR/NMR + EN_* + THIS_LDC + FC_USR[23:16]
+     * @param l2_cfg1  L2-Reg1: ADDR1[31:0] — 过滤匹配地址1 (非本机地址)
+     * @param l2_cfg2  L2-Reg2: ADDR1[47:32]@[15:0] | ADDR2[15:0]@[31:16]
+     * @param l2_cfg3  L2-Reg3: ADDR2[47:16] — 过滤匹配地址2 (非本机地址)
+     * @param l2_cfg4  L2-Reg4: BSSID[31:0]  — 过滤匹配 BSSID 低32bit (v2.1)
+     * @param l2_cfg5  L2-Reg5: BSSID[47:32]@[15:0] + BSSID_UV@[28] (v2.1)
+     *
+     * @note ADDR1/ADDR2 是过滤匹配地址, 与RX帧 addr1/addr2 比较
+     *       BSSID 从 RX 帧提取 (tofrom_ds 决定来源 addr) 后与 L2-Reg4/5 目标值比较
+     *       本机地址 self_mac_addr/self_bssid 由 PL 硬件连线提供, 不走此寄存器
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Filter_Write(
+        uint32_t l0_val,
+        uint32_t l1_cfg0,
+        uint32_t l1_cfg1,
+        uint32_t l2_cfg0,
+        uint32_t l2_cfg1,
+        uint32_t l2_cfg2,
+        uint32_t l2_cfg3,
+        uint32_t l2_cfg4,    // v2.1: BSSID[31:0]
+        uint32_t l2_cfg5)    // v2.1: BSSID[47:32] + UV@[28]
+    {
+        // Step 1: 预装所有寄存器 (UPDATE_VALID=0)
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L0_CTRL, l0_val & ~(1u << CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L1_CFG0, l1_cfg0 & ~(1u << CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L1_CFG1, l1_cfg1 & ~(1u << CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG1, l2_cfg1);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG2, l2_cfg2);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG3, l2_cfg3);
+        // v2.1: BSSID 寄存器预装 (UV=0)
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG4, l2_cfg4);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG5, l2_cfg5 & ~(1u << CREG_HA_RAT_FILTER_BSSID_UV_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG0, l2_cfg0 & ~CREG_HA_RAT_FILTER_L2_UV_ALL_MASK);
+
+        // Step 2: 锁存到影子寄存器 (UPDATE_VALID=1)
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L0_CTRL, l0_val | (1u << CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L1_CFG0, l1_cfg0 | (1u << CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L1_CFG1, l1_cfg1 | (1u << CREG_HA_RAT_FILTER_UPDATE_VALID_OFFSET));
+        // v2.1: BSSID UV 锁存
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG5, l2_cfg5 | (1u << CREG_HA_RAT_FILTER_BSSID_UV_OFFSET));
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_L2_CFG0, l2_cfg0 | CREG_HA_RAT_FILTER_L2_UV_ALL_MASK);
+        return;
+    }
+
+    /**
+     * @brief [DEPRECATED] 旧版单寄存器过滤器 — 已拆分为 L0/L1/L2 三级
+     * 新代码请使用 ANOS_RAT_Cfg_Filter_Write() 或 ANOS_RAT_Cfg_Filter_Default()
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Filter(uint32_t f_filter_flag){
+        rat_write_reg(CREG_HA_RAT_XPU_REG_FILTER_FLAG_DEPRECATED, f_filter_flag);
+    }
+
+    /**
+     * @brief 配置 TX 端 BSSID (用于 Beacon/Association 等发送帧的 BSSID 字段)
+     * @note 此寄存器用于 TX 端, 非 RX 过滤器
+     *       如需 RX 端按 BSSID 过滤: 使用 ANOS_RAT_Cfg_Filter_Write() 将目标 BSSID 写入 L2 ADDR1/ADDR2
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_BSSID(uint8_t* f_bssid_p){
+
+        ANOS_DASSERT(   f_bssid_p != ANOS_NULL,
+                        "ERR: the bssid is NULL !\n\r",
+                        ANOS_NULL);
+
+        uint32_t bssid_cfg_low = 0;
+        uint32_t bssid_cfg_high = 0;
+        uint8_t ix;
+
+        for(ix = 0; ix < ANOS_LOW_MAC_ADDR_MAXLEN; ix++){
+            if(ix < 4){
+                bssid_cfg_low = (bssid_cfg_low) | (((uint32_t)f_bssid_p[ix]) << (ix * 8));
+            }
+            else {
+                bssid_cfg_high = (bssid_cfg_high) | (((uint32_t)f_bssid_p[ix]) << ((ix - 4) * 8));
+            }
+        }
+        rat_write_reg(CREG_HA_RAT_XPU_REG_BSSID_LOW, bssid_cfg_low);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_BSSID_HIGH, bssid_cfg_high);
+        return;
+    }
+
+    /**
+     * @brief 配置 TX 端本机 MAC 地址 (用于 TX 帧头 TA/SA 字段)
+     * @note 此寄存器用于 TX 端, 非 RX 过滤器
+     *       RX 端 L1 SELF_MAC 判定由 PL 硬件连线 self_mac_addr 自动完成
+     *       如需 RX 端按 MAC 地址过滤: 使用 ANOS_RAT_Cfg_Filter_Write() 配置 L2 ADDR1/ADDR2
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_MAC_Addr(uint8_t* f_mac_addr_p){
+
+        ANOS_DASSERT(   f_mac_addr_p != ANOS_NULL,
+                        "ERR: the mac addr is NULL !\n\r",
+                        ANOS_NULL);
+
+        uint32_t mac_addr_cfg_low = 0;
+        uint32_t mac_addr_cfg_high = 0;
+        uint8_t ix;
+
+        for(ix = 0; ix < ANOS_LOW_MAC_ADDR_MAXLEN; ix++){
+            if(ix < 4){
+                mac_addr_cfg_low = (mac_addr_cfg_low) | (((uint32_t)f_mac_addr_p[ix]) << (ix * 8));
+            }
+            else {
+                mac_addr_cfg_high = (mac_addr_cfg_high) | (((uint32_t)f_mac_addr_p[ix]) << ((ix - 4) * 8));
+            }
+        }
+        rat_write_reg(CREG_HA_RAT_XPU_REG_MAC_ADDR_LOW, mac_addr_cfg_low);
+        rat_write_reg(CREG_HA_RAT_XPU_REG_MAC_ADDR_HIGH, mac_addr_cfg_high);
+        return;
+    }
+
+    /**
+     * @brief 配置默认收端过滤器 (匹配旧 ANOS_HA_RAT_FILTER_FLAG 行为)
+     * @note L0: EN_CTRL|EN_DATA|EN_MANAGE (不含ALL_DC)
+     *       L1: CTRL PS_POLL | DATA BROADCAST/MULTICAST/SELF_MAC
+     *            | MANAGE BEACON/DETECT_REQ/DETECT_REP
+     *       L2: THIS_LDC=1 透传 (ADDR1/ADDR2/FC_USR 未使用, 不做地址过滤)
+     *       如需启用 L2 地址过滤: 设置 THIS_LDC=0, 配置 ADDR1/ADDR2/FC_USR
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Filter_Default(void){
+        ANOS_RAT_Cfg_Filter_Write(
+            CREG_HA_RAT_FILTER_DEFAULT_L0_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L1_CFG0_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L1_CFG1_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L2_CFG0_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L2_CFG1_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L2_CFG2_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L2_CFG3_VAL,
+            CREG_HA_RAT_FILTER_DEFAULT_L2_CFG4_VAL,    // v2.1
+            CREG_HA_RAT_FILTER_DEFAULT_L2_CFG5_VAL);   // v2.1
+        return;
+    }
+
+    /**
+     * @brief 配置过滤器屏蔽所有帧 (PS未就绪时使用)
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Filter_BlockAll(void){
+        ANOS_RAT_Cfg_Filter_Write(
+            CREG_HA_RAT_FILTER_BLOCKALL_L0_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L1_CFG0_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L1_CFG1_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG0_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG1_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG2_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG3_VAL,
+            CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG4_VAL,    // v2.1
+            CREG_HA_RAT_FILTER_BLOCKALL_L2_CFG5_VAL);   // v2.1
+        return;
+    }
+
+    /**
+     * @brief 混合接入 RAT 读取发端发送结果 ？？？？
+     * @param f_channel uint8_t
+     *        有效参数: 
+     *        - \b 有效范围 0 ~ 6
+     * @return uint8_t
+     * @note [GEMINI_UPDATE]: Fixed bug - added rat_read_reg to get actual status value
+     */
+    ANOS_INLINE uint8_t ANOS_RAT_Get_Tx_Status(uint8_t f_channel){
+        
+        ANOS_DASSERT(   ((f_channel > 0) && (f_channel <= 6)),
+                        "ERR: channel is wrong !\n\r",
+                        ANOS_NULL);
+
+        uint32_t reg_value;
+        uint32_t reg_mask;
+        uint32_t reg_offset;
+        uint8_t result;
+
+        switch (f_channel){
+            case 1:{
+                reg_mask = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_1_MASK;
+                reg_offset = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_1_OFFSET;
+                break;
+            }
+            case 2:{
+                reg_mask = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_2_MASK;
+                reg_offset = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_2_OFFSET;
+                break;
+            }
+            case 3:{
+                reg_mask = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_3_MASK;
+                reg_offset = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_3_OFFSET;
+                break;
+            }
+            case 4:{
+                reg_mask = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_4_MASK;
+                reg_offset = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_4_OFFSET;
+                break;
+            }
+            case 5:{
+                reg_mask = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_5_MASK;
+                reg_offset = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_5_OFFSET;
+                break;
+            }
+            case 6:{
+                reg_mask = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_6_MASK;
+                reg_offset = CREG_HA_RAT_XPU_TX_RESULT_TX_STATUS_6_OFFSET;
+                break;
+            }
+            default:{
+                LOG_PRINTF("ERR: wrong channel !\n\r");
+                return 0;
+            }
+        }
+        
+        reg_value = rat_read_reg(CREG_HA_RAT_XPU_REG_TX_RESULT);
+
+        result = (reg_value & reg_mask) >> reg_offset;
+
+        return result;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 获取 PL 端上传队列号
+     * @return uint8_t 
+     * @note 
+     */
+    ANOS_INLINE uint8_t ANOS_RAT_Get_Upload_Queue(void){
+        return ((uint8_t)rat_read_reg(CREG_HA_RAT_XPU_REG_TX_QUEUE_NOW_TO_PS));
+    }
+
+    /** 
+     * @brief 混合接入 RAT 获取当前运行时间
+     * @return uint64_t
+     * @note 
+     */
+    ANOS_INLINE uint64_t ANOS_RAT_Get_Run_Time(void){
+        uint64_t run_time;
+
+        run_time = ((uint64_t)rat_read_reg(CREG_HA_RAT_XPU_REG_TSF_RUNTIME_VAL_LOW));
+
+        run_time |=  ((uint64_t)rat_read_reg(CREG_HA_RAT_XPU_REG_TSF_RUNTIME_VAL_HIGH) << CREG_HA_RAT_XPU_RUNTIME_VAL_HIGH_OFFSET);
+
+        return run_time;
+    }
+
+    //* TX_INTF
+
+    /** 
+     * @brief 混合接入 RAT 发端软复位
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Do_Reset(void){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_RESET, CREG_HA_RAT_TX_INTF_REG_RESET_MASK);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 发端清除软复位
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Undo_Reset(void){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_RESET, 0);
+        return;
+    }
+
+    /* CREG_HA_RAT_TX_INTF_REG_BASE_ADDR + 0x14 该寄存器未使用 */
+
+    /** 
+     * @brief 配置混合接入 RAT 发端 混频器
+     * @param f_mixer_cfg uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_Mixer_Cfg(uint32_t f_mixer_cfg){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_MIXER_CFG, f_mixer_cfg);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 发端 WiFi 发送模式
+     * @param f_tx_mode uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_Wifi_Tx_Mode(uint32_t f_tx_mode){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_WIFI_TX_MODE, f_tx_mode);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 发端 IQ 数据源选择
+     * @param f_iq_src uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_IQ_Src_Sel(uint32_t f_iq_src){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_IQ_SRC_SEL, f_iq_src);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 发端 杂项选择 (DAC 连接)
+     * @param f_misc_sel uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_Misc_Sel(uint32_t f_misc_sel){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_MISC_SEL, f_misc_sel);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 发端 基带增益
+     * @param f_bb_gain uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_BB_Gain(uint32_t f_bb_gain){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_BB_GAIN, f_bb_gain);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 发端 START_TRANS_TO_PS_MODE
+     * @param f_mode uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_Start_Trans_To_Ps_Mode(uint32_t f_mode){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_START_TRANS_TO_PS_MODE, f_mode);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT CTS to self 使能
+     * @return void
+     * @note (未启用 无效)
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_CTS_To_Self_Enable(void){
+        rat_set_bit(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG, CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ENABLE_OFFSET);
+        return;
+    }
+    
+    /** 
+     * @brief 混合接入 RAT CTS to self 除能
+     * @return void
+     * @note (未启用 无效)
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_CTS_To_Self_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG, CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ENABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT CTS to self rate sel 使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rate_Sel_Enable(void){
+        rat_set_bit(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG, CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT CTS to self rate sel 除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rate_Sel_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG, CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT CTS to self 配置 802.11 rate sel
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_80211_MAC_Rate_Sel(uint8_t f_rate_sel){
+
+        uint32_t reg_value;
+        uint32_t rate_sel_cfg;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG);
+
+        reg_value = reg_value & (~CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_BY_MAC80211_MASK);
+
+        rate_sel_cfg = ((uint32_t)f_rate_sel << CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_RATE_SEL_BY_MAC80211_OFFSET);
+
+		reg_value = (reg_value | rate_sel_cfg);
+
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT CTS to self 配置 ACTUAL_TRAFFIC_PKT_RATE
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Actual_Pkt_Rate_Sel(uint8_t f_rate_sel){
+
+        uint32_t reg_value;
+        uint32_t rate_sel_cfg;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG);
+
+        reg_value = reg_value & (~CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ACTUAL_TRAFFIC_PKT_RATE_MASK);
+        
+        rate_sel_cfg = ((uint32_t)f_rate_sel << CREG_HA_RAT_TX_INTF_CTS_TOSELF_CONFIG_ACTUAL_TRAFFIC_PKT_RATE_OFFSET);
+
+		reg_value = (reg_value | rate_sel_cfg);
+
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_CTS_TOSELF_CONFIG, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 配置 5G CTS to self delay
+     * @param f_delay uint16_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0000 ~ 0x3FFF
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_CTS_To_Self_Wait_SIFS_5G(uint16_t f_delay){
+        
+        uint32_t delay_cfg;
+        uint32_t reg_value;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_SEND_CTS_TOSELF_WAIT_SIFS_TOP);
+
+        reg_value = reg_value & (~CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_5GHz_MASK);
+
+        delay_cfg = ((uint32_t)f_delay << CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_5GHz_OFFSET) & CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_5GHz_MASK;
+
+		reg_value = (reg_value | delay_cfg);
+
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_SEND_CTS_TOSELF_WAIT_SIFS_TOP, reg_value);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 配置 2.4G CTS to self delay
+     * @param f_delay uint16_t
+     *        有效参数: 
+     *        - \b 有效范围 0x0000 ~ 0x3FFF
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_CTS_To_Self_Wait_SIFS_2_4G(uint16_t f_delay){
+        
+        uint32_t delay_cfg;
+        uint32_t reg_value;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_SEND_CTS_TOSELF_WAIT_SIFS_TOP);
+
+        reg_value = reg_value & (~CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_2dot4GHz_MASK);
+
+        delay_cfg = ((uint32_t)f_delay << CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_2dot4GHz_OFFSET) & CREG_HA_RAT_TX_INTF_SEND_CTS_TOSELF_WAIT_SIFS_TOP_DELAY_IN_2dot4GHz_MASK;
+
+		reg_value = (reg_value | delay_cfg);
+
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_SEND_CTS_TOSELF_WAIT_SIFS_TOP, reg_value);
+        return;
+    }
+
+/* [GEMINI_DELETE]: Obsolete DMA SYMBOL functions
+    ANOS_INLINE void ANOS_RAT_Cfg_DMA_Symbol_Num(uint16_t f_num){
+        uint32_t num_cfg;
+        uint32_t reg_value;
+
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL);
+
+        reg_value = reg_value & (~CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_NUM_DMA_SYMBOL_MASK);
+
+        num_cfg = ((uint32_t)f_num << CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_NUM_DMA_SYMBOL_OFFSET) & CREG_HA_RAT_TX_INTF_NUM_DMA_SYMBOL_TO_PL_NUM_DMA_SYMBOL_MASK;
+
+		reg_value = (reg_value | num_cfg);
+
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL, reg_value);
+        return;
+    }
+*/
+
+    /** 
+     * @brief 配置混合接入 RAT Tx Cfg Data To Ant
+     * @param f_cfg uint32_t
+     * @return void
+     * @note [GEMINI_UPDATE]: Added for latest hardware
+     */
+    ANOS_INLINE void ANOS_RAT_Tx_Cfg_Cfg_Data_To_Ant(uint32_t f_cfg){
+        rat_write_reg(CREG_HA_RAT_TX_INTF_REG_CFG_DATA_TO_ANT, f_cfg);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT Tx It0 使能 
+     * @return None
+     * @note 未测试
+     */
+    ANOS_INLINE void ANOS_RAT_Interrupt0_Enable(void){
+        rat_set_bit(CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL, CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_ENABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT Tx It0 除能 
+     * @return None
+     * @note 未测试
+     */
+    ANOS_INLINE void ANOS_RAT_Interrupt0_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL, CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_ENABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT Tx It1 使能 
+     * @return None
+     * @note 未测试
+     */
+    ANOS_INLINE void ANOS_RAT_Interrupt1_Enable(void){
+        rat_set_bit(CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL, CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_ENABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT Tx It1 除能 
+     * @return None
+     * @note 未测试
+     */
+    ANOS_INLINE void ANOS_RAT_Interrupt1_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL, CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_ENABLE_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 配置中断模式
+     * @param f_mode uint8_t
+     *        有效参数: 
+     *        - \b 非空
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Cfg_Interrupt_Mode(uint8_t f_mode){
+        anos_cfg_reg(CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL,
+                     f_mode,
+                     CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_MODE_MASK,
+                     CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT0_MODE_OFFSET);
+
+        anos_cfg_reg(CREG_HA_RAT_TX_INTF_REG_INTERRUPT_SEL,
+                     f_mode,
+                     CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_MODE_MASK,
+                     CREG_HA_RAT_TX_INTF_INTERRUPT_SEL_TX_ITRPT1_MODE_OFFSET);
+        return;
+    }
+
+    /**
+     * @brief 获取混合接入 RAT Pkt info Tx Queue
+     * @return uint8_t
+     * @note 
+     */
+    ANOS_INLINE uint8_t ANOS_RAT_Get_Pkt_Info_Tx_Queue(void){
+        uint8_t result;
+        uint32_t reg_value;
+        
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_PKT_INFO);
+
+        result = (uint8_t)((reg_value & CREG_HA_RAT_TX_INTF_PKT_INFO_TX_QUEUE_IDX_MASK)  >> CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_SN_OFFSET);
+
+        return result;
+    }
+
+    /** 
+     * @brief 获取混合接入 RAT Pkt info Pkt Sn
+     * @return uint16_t
+     * @note 
+     */
+    ANOS_INLINE uint16_t ANOS_RAT_Get_Pkt_Info_Pkt_Sn(void){
+        uint16_t result;
+        uint32_t reg_value;
+        
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_PKT_INFO);
+
+        result = (uint16_t)((reg_value & CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_SN_MASK)  >> CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_SN_OFFSET);
+
+        return result;
+    }
+
+    /** 
+     * @brief 获取混合接入 RAT Pkt info DMA num (byte)
+     * @return uint16_t
+     * @note 
+     */
+    ANOS_INLINE uint16_t ANOS_RAT_Get_Pkt_Info_DMA_Num(void){
+        uint16_t result;
+        uint32_t reg_value;
+        
+        reg_value = rat_read_reg(CREG_HA_RAT_TX_INTF_REG_PKT_INFO);
+
+        result = (uint16_t)((reg_value & CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_NUM_DMA_BYTE_MASK)  >> CREG_HA_RAT_TX_INTF_PKT_INFO_TX_PKT_NUM_DMA_BYTE_OFFSET);
+
+        return result;
+    }
+
+//* RX_INTF
+
+    /** 
+     * @brief 混合接入 RAT 收端软复位
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Do_Reset(void){
+        rat_write_reg(CREG_HA_RAT_RX_INTF_REG_RESET, CREG_HA_RAT_RX_INTF_RX_INTF_M_AXIS_RESET_MASK);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 收端清除软复位
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Undo_Reset(void){
+        rat_write_reg(CREG_HA_RAT_RX_INTF_REG_RESET, 0);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 收端 M_AXIS 复位状态
+     * @param f_rst uint32_t (0: undo reset, 1: do reset bit 4)
+     * @return void
+     * @note [GEMINI_UPDATE]: Added to match Linux driver logic (bit 4 of MULTI_RST)
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Cfg_M_Axis_Rst(uint32_t f_rst){
+        uint32_t reg_val;
+        reg_val = rat_read_reg(CREG_HA_RAT_RX_INTF_REG_RESET);
+        if (f_rst == 0) {
+            reg_val = (reg_val & (~(1 << 4)));
+        } else {
+            reg_val = (reg_val | (1 << 4));
+        }
+        rat_write_reg(CREG_HA_RAT_RX_INTF_REG_RESET, reg_val);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 收端 自动复位等待时间
+     * @param f_time uint32_t
+     *        有效参数: 
+     *        - \b 非空
+     * @return void
+     * @note [GEMINI_UPDATE]: Added to match latest Linux side config
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Cfg_Auto_Rst_Wait_Time(uint32_t f_time){
+        rat_write_reg(CREG_HA_RAT_RX_INTF_REG_AUTO_RST_WAIT_TIME, f_time);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 收端无尽模式使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Endless_Mode_Enable(void){
+        rat_set_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_MODE, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_ENDLESS_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 收端无尽模式除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Endless_Mode_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_MODE, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_ENDLESS_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 收端监视DMA上传字节数模式使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Monitor_DMA_Symbol_Mode_Enable(void){
+        rat_set_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_MODE, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_NUM_DMA_SYMBOL_TO_PS_SEL_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT 收端监视DMA上传字节数模式除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Monitor_DMA_Symbol_Mode_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_MODE, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_NUM_DMA_SYMBOL_TO_PS_SEL_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 收端 MAXIS_TRANS_TRIGGER
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Cfg_Max_Trans_Trigger(uint8_t f_trigger){
+
+        anos_cfg_reg(   CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_MODE,
+                        f_trigger,
+                        CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_SOURCE_OF_MAXIS_TRANS_TRIGGER_MASK,
+                        CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_MODE_SOURCE_OF_MAXIS_TRANS_TRIGGER_OFFSET);
+        return;
+    }
+
+    /** 
+     * @brief 混合接入 RAT ????? 使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Start_1_Trans_Ext_Trigger_Enable(void){
+        rat_set_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_START_1TRANS_EXT_TRIGGER_OFFSET);
+    }
+
+    /** 
+     * @brief 混合接入 RAT ????? 除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Start_1_Trans_Ext_Trigger_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_START_1TRANS_EXT_TRIGGER_OFFSET);
+    }
+
+    /** 
+     * @brief 混合接入 RAT ????? 使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Ps_Src_Enable(void){
+        rat_set_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_SRC_SEL, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_SRC_SEL_OFFSET);
+    }
+
+    /** 
+     * @brief 混合接入 RAT ????? 除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Ps_Src_Disable(void){
+        rat_clear_bit(CREG_HA_RAT_RX_INTF_REG_START_TRANS_TO_PS_SRC_SEL, CREG_HA_RAT_RX_INTF_START_TRANS_TO_PS_SRC_SEL_OFFSET);
+    }
+    
+
+/* [GEMINI_DELETE]: Obsolete DMA_Num_To_Ps function
+    ANOS_INLINE void ANOS_RAT_Cfg_DMA_Num_To_Ps(uint16_t f_num){
+
+        anos_cfg_reg(   CREG_HA_RAT_RX_INTF_REG_NUM_DMA_SYMBOL_TO_PS,
+                        (uint32_t)f_num,
+                        CREG_HA_RAT_RX_INTF_NUM_DMA_SYMBOL_TO_PS_MASK,
+                        CREG_HA_RAT_RX_INTF_NUM_DMA_SYMBOL_TO_PS_OFFSET);
+        
+        return;
+    }
+*/
+
+    /** 
+     * @brief 混合接入 RAT 收端自动回复？？？ 使能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Auto_Recover_Enable(void){
+        rat_clear_bit(CREG_HA_RAT_RX_INTF_REG_TLAST_TIMEOUT_TOP, CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_AUTO_RECOVER_DISABLE_OFFSET);
+    }
+
+    /** 
+     * @brief 混合接入 RAT 收端自动回复？？？ 除能
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Auto_Recover_Disable(void){
+        rat_set_bit(CREG_HA_RAT_RX_INTF_REG_TLAST_TIMEOUT_TOP, CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_AUTO_RECOVER_DISABLE_OFFSET);
+    }
+
+    /** 
+     * @brief 配置混合接入 RAT 收端 m_tlast 超时时间
+     * @param f_time uint16_t
+     *        有效参数: 
+     *        - \b 非空
+     * @return void
+     * @note 
+     */
+    ANOS_INLINE void ANOS_RAT_Rx_Cfg_M_Tlast_Timeout(uint16_t f_time){
+        anos_cfg_reg(   CREG_HA_RAT_RX_INTF_REG_TLAST_TIMEOUT_TOP,
+                        (uint32_t)f_time,
+                        CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_TIMEOUT_US_MASK,
+                        CREG_HA_RAT_RX_INTF_TLAST_TIMEOUT_TOP_M_AXIS_TLAST_TIMEOUT_US_OFFSET);
+        
+        return;
+    }
+
+    extern anos_err_t ANOS_HA_RAT_Init(void);
+    extern void ANOS_HA_Ps_Is_Not_Ready(void);
+    extern void ANOS_HA_Ps_Is_Ready(void);
+
+
+// /**
+//  * @brief csma_mac_set_short_time_band_channel //t_todo
+//  * @param value
+//  * @param channel
+//  * @param band
+//  * @return None
+//  * @note 未测试
+//  */
+// inline void csma_mac_set_short_time_band_channel(anos_bool_t value, uint32_t channel, enum frequency_band band)
+// {
+// 	rat_write_reg(CREG_HA_RAT_XPU_REG_BAND_CHANNEL, (value << 24) | ((band << 16) & CREG_HA_RAT_XPU_BAND_CHANNEL_BAND_MASK) | (channel & CREG_HA_RAT_XPU_BAND_CHANNEL_CHANNEL_MASK));
+// }
+
+// inline void csma_mac_set_rssi_cfg(uint32_t rssi_half_db_offset, uint32_t agc_delay_ctrl)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_RSSI_CFG, HYBRID_ACCESS_CSMA_MASK_RSSI_DODULE_RESET | (agc_delay_ctrl & HYBRID_ACCESS_CSMA_MASK_AGC_DELAY_CTL) | ((rssi_half_db_offset << 16) & HYBRID_ACCESS_CSMA_MASK_RSSI_HALF_DB_OFFSET));
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_RSSI_CFG, (~HYBRID_ACCESS_CSMA_MASK_RSSI_DODULE_RESET) | (agc_delay_ctrl & HYBRID_ACCESS_CSMA_MASK_AGC_DELAY_CTL) | ((rssi_half_db_offset << 16) & HYBRID_ACCESS_CSMA_MASK_RSSI_HALF_DB_OFFSET));
+// }
+
+// inline void csma_mac_set_rssi_half_bd_th(uint32_t rssi_half_bd_th)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_RSSI_BD_TH, (rssi_half_bd_th & HYBRID_ACCESS_CSMA_MASK_RSSI_HALF_DB_TH));
+// }
+
+// inline void csma_mac_set_disable_use_default_time(anos_bool_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_SET_TIME, (Read_Register(HYBRID_ACCESS_CSMA_SET_TIME) & (~HYBRID_ACCESS_CSMA_MASK_USE_SELF_DEFINE)) | ((value << 31) & HYBRID_ACCESS_CSMA_MASK_USE_SELF_DEFINE));
+// }
+
+// inline void csma_mac_set_preamble_sig_time_us(uint32_t time_value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_SET_TIME, (Read_Register(HYBRID_ACCESS_CSMA_SET_TIME) & (~HYBRID_ACCESS_CSMA_MASK_PREAMBLE_SIG_TIME)) | ((time_value << 24) & HYBRID_ACCESS_CSMA_MASK_PREAMBLE_SIG_TIME));
+// }
+
+// inline void csma_mac_set_ofdm_symbol_time_us(uint32_t time_value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_SET_TIME, (Read_Register(HYBRID_ACCESS_CSMA_SET_TIME) & (~HYBRID_ACCESS_CSMA_MASK_OFDM_SYMBOL_TIME)) | ((time_value << 19) & HYBRID_ACCESS_CSMA_MASK_OFDM_SYMBOL_TIME));
+// }
+
+// inline void csma_mac_set_slot_time_us(uint32_t time_value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_SET_TIME, (Read_Register(HYBRID_ACCESS_CSMA_SET_TIME) & (~HYBRID_ACCESS_CSMA_MASK_SLOT_TIME)) | ((time_value << 14) & HYBRID_ACCESS_CSMA_MASK_SLOT_TIME));
+// }
+
+// inline void csma_mac_set_sifs_time_us(uint32_t time_value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_SET_TIME, (Read_Register(HYBRID_ACCESS_CSMA_SET_TIME) & (~HYBRID_ACCESS_CSMA_MASK_SIFS_TIME)) | ((time_value << 7) & HYBRID_ACCESS_CSMA_MASK_SIFS_TIME));
+// }
+
+// inline void csma_mac_set_phy_rx_start_delay_time_us(uint32_t time_value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_SET_TIME, (Read_Register(HYBRID_ACCESS_CSMA_SET_TIME) & (~HYBRID_ACCESS_CSMA_MASK_PHY_RX_DELAY_TIME)) | (time_value & HYBRID_ACCESS_CSMA_MASK_PHY_RX_DELAY_TIME));
+// }
+
+// inline void csma_mac_set_bb_rf_delay_count_top(uint32_t rf_count_top)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_BB_RF_DELAY_COUNT_TOP, (rf_count_top & HYBRID_ACCESS_CSMA_MASK_BB_RF_DELAY_COUNT_TOP));
+// }
+
+// inline void csma_mac_set_retrans_max(uint32_t max_num)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_MAX_RETRANS_NUM, (max_num & HYBRID_ACCESS_CSMA_MASK_MAX_RETRANS_NUM));
+// }
+
+// inline void csma_mac_set_need_ack(anos_bool_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_ACK_CFG, (Read_Register(HYBRID_ACCESS_CSMA_ACK_CFG) & (~HYBRID_ACCESS_CSMA_MASK_PKT_NEED_ACK)) | ((value << 31) & HYBRID_ACCESS_CSMA_MASK_PKT_NEED_ACK));
+// }
+
+// inline void csma_mac_set_ack_wait_top(uint32_t value_2_4, uint32_t value_5_2)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_ACK_CFG, (Read_Register(HYBRID_ACCESS_CSMA_ACK_CFG) & (HYBRID_ACCESS_CSMA_MASK_PKT_NEED_ACK)) | ((value_5_2 << 16) & HYBRID_ACCESS_CSMA_MASK_ACK_WAIT_TOP_5_2G) | (value_2_4 & HYBRID_ACCESS_CSMA_MASK_ACK_WAIT_TOP_2_4G));
+// }
+
+// inline void csma_mac_set_cw_min(uint32_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE, (Read_Register(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE) & (~HYBRID_ACCESS_CSMA_MASK_CW_MIN)) | (value & HYBRID_ACCESS_CSMA_MASK_CW_MIN));
+// }
+
+// inline void csma_mac_set_NAV_enable(anos_bool_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE, (Read_Register(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE) & (~HYBRID_ACCESS_CSMA_MASK_NAV_ENABLE)) | ((value << 31) & HYBRID_ACCESS_CSMA_MASK_NAV_ENABLE));
+// }
+
+// inline void csma_mac_set_difs_enable(anos_bool_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE, (Read_Register(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE) & (~HYBRID_ACCESS_CSMA_MASK_DIFS_ENBLE)) | ((value << 30) & HYBRID_ACCESS_CSMA_MASK_DIFS_ENBLE));
+// }
+
+// inline void csma_mac_set_eifs(anos_bool_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE, (Read_Register(HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE) & (~HYBRID_ACCESS_CSMA_MASK_EIFS_ENBLE)) | ((value << 29) & HYBRID_ACCESS_CSMA_MASK_EIFS_ENBLE));
+// }
+
+// inline void csma_mac_set_cts_rts_disable(anos_bool_t value) // 0
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE, (Read_Register(HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE) & (~HYBRID_ACCESS_CSMA_MASK_CTS_RTS_ENBLE)) | ((value << 31) & HYBRID_ACCESS_CSMA_MASK_CTS_RTS_ENBLE));
+// }
+
+// inline void csma_mac_set_cts_rts_rate(uint32_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE, (Read_Register(HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE) & (~HYBRID_ACCESS_CSMA_MASK_CTS_RTS_RATE)) | ((value << 16) & HYBRID_ACCESS_CSMA_MASK_CTS_RTS_RATE));
+// }
+
+// inline void csma_mac_set_duration_extra(uint32_t value) // 0
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE, (Read_Register(HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE) & (~HYBRID_ACCESS_CSMA_MASK_DURATION_EXTRA)) | ((value)&HYBRID_ACCESS_CSMA_MASK_DURATION_EXTRA));
+// }
+
+// inline void csma_mac_set_rx_pkt_discard_mask(uint32_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_PKT_FILTER, (Read_Register(HYBRID_ACCESS_CSMA_PKT_FILTER) & (~HYBRID_ACCESS_CSMA_MASK_HIGH_PROIRITY_DICARD)) | ((value << 16) & HYBRID_ACCESS_CSMA_MASK_HIGH_PROIRITY_DICARD));
+// }
+
+// inline void csma_mac_set_rx_pkt_filter_cfg(uint32_t value)
+// {
+// 	rat_write_reg(HYBRID_ACCESS_CSMA_PKT_FILTER, (Read_Register(HYBRID_ACCESS_CSMA_PKT_FILTER) & (~HYBRID_ACCESS_CSMA_MASK_FILTER_CFG)) | ((value)&HYBRID_ACCESS_CSMA_MASK_FILTER_CFG));
+// }
+
+// // //tx_interface slv_reg 4
+// // // reg [1:0] rts_cts_select // 0:no rts or cts  1:cts_to_self  2:rts/cts
+// // // reg cts_use_traffic_rate
+// // // reg [4:0] wave_type_def
+// // // reg [15:0] cts_duration
+// // // reg [3:0] cts_rate_signal_value
+// // // reg [3:0] rate_signal_value
+// // inline void csma_tx_interface_set_rts_cts_select(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_CTS_TOSELF_CONFIG, (Read_Register(TX_INTF_REG_CTS_TOSELF_CONFIG) & (~CTS_TOSELF_CONFIG_MASK_RTS_CTS_SELECT)) | ((value << 30)&CTS_TOSELF_CONFIG_MASK_RTS_CTS_SELECT));
+// // }
+
+// // inline void csma_tx_interface_set_cts_use_traffic_rate(anos_bool_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_CTS_TOSELF_CONFIG, (Read_Register(TX_INTF_REG_CTS_TOSELF_CONFIG) & (~CTS_TOSELF_CONFIG_MASK_CTS_USE_TRAFFIC_RATE)) | ((value << 29)&CTS_TOSELF_CONFIG_MASK_CTS_USE_TRAFFIC_RATE));
+// // }
+
+// // inline void csma_tx_interface_set_wave_type_def(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_CTS_TOSELF_CONFIG, (Read_Register(TX_INTF_REG_CTS_TOSELF_CONFIG) & (~CTS_TOSELF_CONFIG_MASK_WAVE_TYPE_DEF)) | ((value << 24)&CTS_TOSELF_CONFIG_MASK_WAVE_TYPE_DEF));
+// // }
+
+// // inline void csma_tx_interface_set_cts_duration(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_CTS_TOSELF_CONFIG, (Read_Register(TX_INTF_REG_CTS_TOSELF_CONFIG) & (~CTS_TOSELF_CONFIG_MASK_CTS_DURATION)) | ((value << 8)&CTS_TOSELF_CONFIG_MASK_CTS_DURATION));
+// // }
+
+// // inline void csma_tx_interface_set_cts_rate_signal_value(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_CTS_TOSELF_CONFIG, (Read_Register(TX_INTF_REG_CTS_TOSELF_CONFIG) & (~CTS_TOSELF_CONFIG_MASK_CTS_RATE_SIGNAL_VALUE)) | ((value << 4)&CTS_TOSELF_CONFIG_MASK_CTS_RATE_SIGNAL_VALUE));
+// // }
+
+// // inline void csma_tx_interface_set_rate_signal_value(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_CTS_TOSELF_CONFIG, (Read_Register(TX_INTF_REG_CTS_TOSELF_CONFIG) & (~CTS_TOSELF_CONFIG_MASK_RATE_SIGNAL_VALUE)) | ((value)&CTS_TOSELF_CONFIG_MASK_RATE_SIGNAL_VALUE));
+// // }
+
+// // //tx_interface slv_reg 8
+// // // reg [10:0]phy_tx_sn
+// // // reg [2:0] queue_idx
+// // // reg [3:0] retry_limit_nums
+// // // reg pkt_need_ack
+// // // reg [12:0] num_dma_symbol
+// // inline void csma_tx_interface_set_phy_tx_sn(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL, (Read_Register(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL) & (~NUM_DMA_SYMBOL_TO_PL_MASK_PHY_TX_SN)) | ((value << 21)&NUM_DMA_SYMBOL_TO_PL_MASK_PHY_TX_SN));
+// // }
+
+// // inline void csma_tx_interface_set_queue_idx(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL, (Read_Register(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL) & (~NUM_DMA_SYMBOL_TO_PL_MASK_TX_QUEUE_IDX_FROM_PS)) | ((value << 18)&NUM_DMA_SYMBOL_TO_PL_MASK_TX_QUEUE_IDX_FROM_PS));
+// // }
+
+// // inline void csma_tx_interface_set_retry_limit_nums(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL, (Read_Register(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL) & (~NUM_DMA_SYMBOL_TO_PL_MASK_TX_PKT_RETRY_LIMIT_HW)) | ((value << 14)&NUM_DMA_SYMBOL_TO_PL_MASK_TX_PKT_RETRY_LIMIT_HW));
+// // }
+
+// // inline void csma_tx_interface_set_pkt_need_ack(anos_bool_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL, (Read_Register(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL) & (~NUM_DMA_SYMBOL_TO_PL_MASK_TX_PKT_NEED_ACK)) | ((value << 13)&NUM_DMA_SYMBOL_TO_PL_MASK_TX_PKT_NEED_ACK));
+// // }
+
+// // inline void csma_tx_interface_set_num_dma_symbol(uint32_t value)
+// // {
+// // 	rat_write_reg(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL, (Read_Register(TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL) & (~NUM_DMA_SYMBOL_TO_PL_MASK_NUM_DMA_SYMBOL)) | ((value)&NUM_DMA_SYMBOL_TO_PL_MASK_NUM_DMA_SYMBOL));
+// // }
+
+// // tx_interface slv_reg 11
+// inline void csma_tx_interface_set_regconfig_valid(uint32_t value)
+// {
+// 	rat_write_reg(TX_INTF_REG_WRITE_VALID, (Read_Register(TX_INTF_REG_WRITE_VALID) & (~TX_INTF_REG_MASK_WRITE_VALID)) | ((value)&TX_INTF_REG_MASK_WRITE_VALID));
+// }
+
+// // HighPriorityQueueENc slv_reg0
+// inline void csma_HighPriorityQueueENc_set_queue_compete_en(uint32_t value)
+// {
+// 	rat_write_reg(HIGH_PRIORITY_CTRL_QUEUE_COMPETE_EN, (Read_Register(HIGH_PRIORITY_CTRL_QUEUE_COMPETE_EN) & (~QUEUE_COMPETE_EN_MASK_QUEUE_EN)) | ((value)&QUEUE_COMPETE_EN_MASK_QUEUE_EN));
+// }
+
+// // HighPriorityQueueENc slv_reg1
+// inline void csma_HighPriorityQueueENc_set_queue_compete_en_valid(anos_bool_t value)
+// {
+// 	rat_write_reg(HIGH_PRIORITY_CTRL_QUEUE_EN_COMPETE_VALID, (Read_Register(HIGH_PRIORITY_CTRL_QUEUE_EN_COMPETE_VALID) & (~QUEUE_COMPETE_EN_VALID_MASK_VALID)) | ((value)&QUEUE_COMPETE_EN_VALID_MASK_VALID));
+// }
+// // HighPriorityQueueENc slv_reg5
+// inline void csma_HighPriorityQueueENc_set_regconfig_valid(anos_bool_t value)
+// {
+// 	rat_write_reg(HIGH_PRIORITY_CTRL_WRITE_VALID, (Read_Register(HIGH_PRIORITY_CTRL_WRITE_VALID) & (~HIGH_PRIORITY_CTRL_MASK_WRITE_VALID)) | ((value)&HIGH_PRIORITY_CTRL_MASK_WRITE_VALID));
+// }
+// // HighPriorityQueueENc slv_reg4
+// inline void csma_HighPriorityQueueENc_set_duration(uint32_t value)
+// {
+// 	rat_write_reg(HIGH_PRIORITY_CTRL_QUEUE_DURATION, (Read_Register(HIGH_PRIORITY_CTRL_QUEUE_DURATION) & (~QUEUE_DURATION_MASK_DURATION)) | ((value)&QUEUE_DURATION_MASK_DURATION));
+// }
+
+// inline void csma_HighPriorityQueueENc_set_queue_index(uint32_t value)
+// {
+// 	rat_write_reg(HIGH_PRIORITY_CTRL_QUEUE_DURATION, (Read_Register(HIGH_PRIORITY_CTRL_QUEUE_DURATION) & (~QUEUE_DURATION_MASK_QUEUE_IDX)) | ((value << 16)&QUEUE_DURATION_MASK_QUEUE_IDX));
+// }
+
+// // inline void csma_HighPriorityQueueENc_set_updge_valid(anos_bool_t value)
+// // {
+// // 	rat_write_reg(HIGH_PRIORITY_CTRL_QUEUE_DURATION, (Read_Register(HIGH_PRIORITY_CTRL_QUEUE_DURATION) & (~QUEUE_DURATION_MASK_UPEDGE_VALID)) | ((value << 31)&QUEUE_DURATION_MASK_UPEDGE_VALID));
+// // }
+// //
+
+
+    // extern void csma_mac_set_short_time_band_channel(anos_bool_t value, uint32_t channel, enum frequency_band band);
+    // // extern void csma_mac_set_cts_toself_enable(anos_bool_t value);
+    // // extern void csma_mac_set_ctstoself_wait_sifs(uint32_t value_2_4, uint32_t value_5_2);
+    // // extern void csma_mac_set_tsf_us(uint64_t time_value);
+    // // extern uint64_t csma_mac_get_tsf_us();
+    // extern void csma_mac_set_rssi_cfg(uint32_t rssi_half_db_offset, uint32_t agc_delay_ctrl);
+    // extern void csma_mac_set_rssi_half_bd_th(uint32_t rssi_half_bd_th);
+    // extern void csma_mac_set_disable_use_default_time(anos_bool_t value);
+    // extern void csma_mac_set_preamble_sig_time_us(uint32_t time_value);
+    // extern void csma_mac_set_ofdm_symbol_time_us(uint32_t time_value);
+    // extern void csma_mac_set_slot_time_us(uint32_t time_value);
+    // extern void csma_mac_set_sifs_time_us(uint32_t time_value);
+    // extern void csma_mac_set_phy_rx_start_delay_time_us(uint32_t time_value);
+    // extern void csma_mac_set_bb_rf_delay_count_top(uint32_t rf_count_top);
+    // extern void csma_mac_set_retrans_max(uint32_t max_num);
+    // extern void csma_mac_set_need_ack(anos_bool_t value);
+    // extern void csma_mac_set_ack_wait_top(uint32_t value_2_4, uint32_t value_5_2);
+    // extern void csma_mac_set_NAV_enable(anos_bool_t value);
+    // extern void csma_mac_set_difs_enable(anos_bool_t value);
+    // extern void csma_mac_set_eifs(anos_bool_t value);
+    // extern void csma_mac_set_cw_min(uint32_t value);
+    // extern void csma_mac_set_cts_rts_disable(anos_bool_t value);
+    // extern void csma_mac_set_cts_rts_rate(uint32_t value);
+    // extern void csma_mac_set_duration_extra(uint32_t value);
+    // extern void csma_mac_set_rx_pkt_discard_mask(uint32_t value);
+    // extern void csma_mac_set_rx_pkt_filter_cfg(uint32_t value);
+    // extern void csma_mac_set_loacal_mac_addr(uint8_t *mac_addr);
+    // extern void csma_mac_set_bssid(uint8_t *bssid);
+
+    // // extern void csma_tx_interface_set_rts_cts_select(uint32_t value);
+    // // extern void csma_tx_interface_set_cts_use_traffic_rate(anos_bool_t value);
+    // // extern void csma_tx_interface_set_wave_type_def(uint32_t value);
+    // // extern void csma_tx_interface_set_cts_duration(uint32_t value);
+    // // extern void csma_tx_interface_set_cts_rate_signal_value(uint32_t value);
+    // // extern void csma_tx_interface_set_rate_signal_value(uint32_t value);
+    // // extern void csma_tx_interface_set_phy_tx_sn(uint32_t value);
+    // // extern void csma_tx_interface_set_queue_idx(uint32_t value);
+    // // extern void csma_tx_interface_set_retry_limit_nums(uint32_t value);
+    // // extern void csma_tx_interface_set_pkt_need_ack(anos_bool_t value);
+    // // extern void csma_tx_interface_set_num_dma_symbol(uint32_t value);
+    // extern void csma_tx_interface_set_regconfig_valid(uint32_t value);
+
+    // extern void csma_HighPriorityQueueENc_set_queue_compete_en(uint32_t value);
+    // extern void csma_HighPriorityQueueENc_set_queue_compete_en_valid(anos_bool_t value);
+    // extern void csma_HighPriorityQueueENc_set_regconfig_valid(anos_bool_t value);
+    // extern void csma_HighPriorityQueueENc_set_duration(uint32_t value);
+    // extern void csma_HighPriorityQueueENc_set_queue_index(uint32_t value);
+    // // extern void csma_HighPriorityQueueENc_set_updge_valid(anos_bool_t value);
+    // extern void lowmac_send_config(csma_ctl_info_t *csma_ctl_info_ptr);
+    // extern void rat_lowmac_hw_init();
+
+#ifdef __cplusplus // Compatible C++
+}
+#endif
+#endif // endif __CSMA_LMAC_H_PROTECT
+
+/*-------------------------------------------------------*\
+                    Example Helper
+\*-------------------------------------------------------*/
+
+/* Documents for direct replication */
+
+/*
+ * name:/
+ * des:/
+ * how2use:/
+ * other:/
+ */
+/*
+...
+*/
+
+//* old
+/*
+// csma_lowmac_define  // XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_XPU_0_BASEADDR
+#define HYBRID_ACCESS_CSMA_CHANNEL_BAND XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 4 * 4
+// #define HYBRID_ACCESS_CSMA_CTSTOSELF_WAIT_SIFS     XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 1 * 4
+// #define HYBRID_ACCESS_CSMA_SET_TIME_LOW            XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 2 * 4
+// #define HYBRID_ACCESS_CSMA_SET_TIME_HIGH           XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 3 * 4
+#define HYBRID_ACCESS_CSMA_RSSI_CFG XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 7 * 4
+#define HYBRID_ACCESS_CSMA_RSSI_BD_TH XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 8 * 4
+#define HYBRID_ACCESS_CSMA_SET_TIME XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 9 * 4
+#define HYBRID_ACCESS_CSMA_BB_RF_DELAY_COUNT_TOP XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 10 * 4
+#define HYBRID_ACCESS_CSMA_MAX_RETRANS_NUM XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 11 * 4
+// #define HYBRID_ACCESS_CSMA_MAX_RETRANS_NUM         XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 8 * 4
+#define HYBRID_ACCESS_CSMA_ACK_CFG XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 18 * 4
+#define HYBRID_ACCESS_CSMA_NAV_DIFS_EIFS_ENABLE XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 19 * 4
+#define HYBRID_ACCESS_CSMA_CTS_TORTS_ENBLE XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 26 * 4
+#define HYBRID_ACCESS_CSMA_PKT_FILTER XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 27 * 4
+#define HYBRID_ACCESS_CSMA_BSSID_ADDRESS_LOW XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 28 * 4
+#define HYBRID_ACCESS_CSMA_BSSID_ADDRESS_HIGH XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 29 * 4
+#define HYBRID_ACCESS_CSMA_SELF_MAC_ADDRESS_LOW XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 30 * 4
+#define HYBRID_ACCESS_CSMA_SELF_MAC_ADDRESS_HIGH XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_LOW_MAC_BASEADDR + 31 * 4
+
+#define HYBRID_ACCESS_CSMA_MASK_BAND (0x000f0000)
+#define HYBRID_ACCESS_CSMA_MASK_CHANNEL (0x0000ffff)
+#define HYBRID_ACCESS_CSMA_MASK_USE_SHORT_TIME (0x01000000)
+#define HYBRID_ACCESS_CSMA_MASK_CTS_TOSELF_ENABLE (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_CTS_TOSELF_WAIT_SIFS_5_2G (0x3fff0000)
+#define HYBRID_ACCESS_CSMA_MASK_CTS_TOSELF_WAIT_SIFS_2_4G (0x00003fff)
+#define HYBRID_ACCESS_CSMA_TSF_LOAD_VAL_SET_MASK (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_RSSI_DODULE_RESET (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_RSSI_HALF_DB_OFFSET (0x07ff0000)
+#define HYBRID_ACCESS_CSMA_MASK_AGC_DELAY_CTL (0x0000007f)
+#define HYBRID_ACCESS_CSMA_MASK_RSSI_HALF_DB_TH (0x000007ff)
+#define HYBRID_ACCESS_CSMA_MASK_USE_SELF_DEFINE (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_PREAMBLE_SIG_TIME (0x7f000000)
+#define HYBRID_ACCESS_CSMA_MASK_OFDM_SYMBOL_TIME (0x00f80000)
+#define HYBRID_ACCESS_CSMA_MASK_SLOT_TIME (0x0007c000)
+#define HYBRID_ACCESS_CSMA_MASK_SIFS_TIME (0x00003f80)
+#define HYBRID_ACCESS_CSMA_MASK_PHY_RX_DELAY_TIME (0x0000007f)
+#define HYBRID_ACCESS_CSMA_MASK_BB_RF_DELAY_COUNT_TOP (0x00000fff)
+#define HYBRID_ACCESS_CSMA_MASK_MAX_RETRANS_NUM (0x0000000f)
+#define HYBRID_ACCESS_CSMA_MASK_PKT_NEED_ACK (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_ACK_WAIT_TOP_2_4G (0x00007fff)
+#define HYBRID_ACCESS_CSMA_MASK_ACK_WAIT_TOP_5_2G (0x7fff0000)
+#define HYBRID_ACCESS_CSMA_MASK_NAV_ENABLE (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_DIFS_ENBLE (0x40000000)
+#define HYBRID_ACCESS_CSMA_MASK_EIFS_ENBLE (0x20000000)
+#define HYBRID_ACCESS_CSMA_MASK_CW_MIN (0x00000fff)
+#define HYBRID_ACCESS_CSMA_MASK_CTS_RTS_ENBLE (0x80000000)
+#define HYBRID_ACCESS_CSMA_MASK_CTS_RTS_RATE (0x001f0000)
+#define HYBRID_ACCESS_CSMA_MASK_DURATION_EXTRA (0x0000ffff)
+#define HYBRID_ACCESS_CSMA_MASK_HIGH_PROIRITY_DICARD (0x00ff0000)
+#define HYBRID_ACCESS_CSMA_MASK_FILTER_CFG (0x00003fff)
+
+// tx interface define // XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_TX_0_BASEADDR
+#define TX_INTERFACE_MEMMAP_PKTBUF_STATE XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_TX_INTF_BASEADDR
+#define TX_INTERFACE_MEMMAP_CLEAN_BUF XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_TX_INTF_BASEADDR + 1 * 4
+#define TX_INTF_REG_CTS_TOSELF_CONFIG XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_TX_INTF_BASEADDR + 4 * 4
+#define TX_INTF_REG_NUM_DMA_SYMBOL_TO_PL XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_TX_INTF_BASEADDR + 8 * 4
+#define TX_INTF_REG_WRITE_VALID XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_PHY_TX_INTF_BASEADDR + 11 * 4
+
+#define CTS_TOSELF_CONFIG_MASK_RTS_CTS_SELECT (0xC0000000)
+#define CTS_TOSELF_CONFIG_MASK_CTS_USE_TRAFFIC_RATE (0x20000000)
+#define CTS_TOSELF_CONFIG_MASK_WAVE_TYPE_DEF (0x1F000000)
+#define CTS_TOSELF_CONFIG_MASK_CTS_DURATION (0x00FFFF00)
+#define CTS_TOSELF_CONFIG_MASK_CTS_RATE_SIGNAL_VALUE (0x000000F0)
+#define CTS_TOSELF_CONFIG_MASK_RATE_SIGNAL_VALUE (0x0000000F)
+
+#define NUM_DMA_SYMBOL_TO_PL_MASK_PHY_TX_SN (0xFFE00000)
+#define NUM_DMA_SYMBOL_TO_PL_MASK_TX_QUEUE_IDX_FROM_PS (0x001C0000)
+#define NUM_DMA_SYMBOL_TO_PL_MASK_TX_PKT_RETRY_LIMIT_HW (0x0003C000)
+#define NUM_DMA_SYMBOL_TO_PL_MASK_TX_PKT_NEED_ACK (0x00002000)
+#define NUM_DMA_SYMBOL_TO_PL_MASK_NUM_DMA_SYMBOL (0x00001FFF)
+
+#define TX_INTF_REG_MASK_WRITE_VALID (0x0000003F)
+
+// HighPriorityQueueENc define
+#define HIGH_PRIORITY_CTRL_QUEUE_COMPETE_EN XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_CTLTOP_0_BASEADDR
+#define HIGH_PRIORITY_CTRL_QUEUE_EN_COMPETE_VALID XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_CTLTOP_0_BASEADDR + 1 * 4
+#define HIGH_PRIORITY_CTRL_QUEUE_DURATION XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_CTLTOP_0_BASEADDR + 4 * 4
+#define HIGH_PRIORITY_CTRL_WRITE_VALID XPAR_H_HA_SCIM_H_SCIM_RAT_LMAC_CTLTOP_0_BASEADDR + 5 * 4
+
+#define QUEUE_COMPETE_EN_MASK_QUEUE_EN (0x0000003F)
+#define QUEUE_COMPETE_EN_VALID_MASK_VALID (0x00000001)
+
+#define QUEUE_DURATION_MASK_QUEUE_IDX (0x00070000)
+#define QUEUE_DURATION_MASK_DURATION (0x0000FFFF)
+#define HIGH_PRIORITY_CTRL_MASK_WRITE_VALID (0x00000001)
+
+
+*/
